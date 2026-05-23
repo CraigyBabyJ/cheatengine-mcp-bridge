@@ -87,6 +87,7 @@ sys.stdout = sys.stderr
 
 # Now safe to import libraries that might print during import
 import json
+import socket
 import struct
 import time
 import math
@@ -94,10 +95,6 @@ import threading
 import traceback
 
 try:
-    import win32file
-    import win32pipe
-    import win32con
-    import pywintypes
     from mcp.server.fastmcp import FastMCP
     
     # CRITICAL: Also patch the reference inside the fastmcp module
@@ -109,6 +106,13 @@ try:
 except ImportError as e:
     print(f"[MCP CE] Import Error: {e}", file=sys.stderr, flush=True)
     sys.exit(1)
+
+try:
+    import win32file
+    import pywintypes
+except ImportError:
+    win32file = None
+    pywintypes = None
 
 # Restore stdout for MCP usage after imports are complete
 sys.stdout = _mcp_stdout
@@ -135,6 +139,8 @@ def format_result(result):
 PIPE_NAME = r"\\.\pipe\CE_MCP_Bridge_v99"
 MCP_SERVER_NAME = "cheatengine"
 MAX_RESPONSE_SIZE_BYTES = 32 * 1024 * 1024
+DEFAULT_TCP_HOST = "127.0.0.1"
+DEFAULT_TCP_PORT = 9876
 
 
 def _parse_timeout_seconds(raw_value):
@@ -154,47 +160,67 @@ def _parse_timeout_seconds(raw_value):
 
 CE_MCP_TIMEOUT_SECONDS = _parse_timeout_seconds(os.environ.get("CE_MCP_TIMEOUT"))
 
+
+def _parse_transport(raw_value):
+    """Parse CE_MCP_TRANSPORT; defaults to Windows named pipe."""
+    transport = (raw_value or "pipe").strip().lower()
+    aliases = {
+        "named_pipe": "pipe",
+        "named-pipe": "pipe",
+        "np": "pipe",
+        "socket": "tcp",
+    }
+    transport = aliases.get(transport, transport)
+    if transport not in {"pipe", "tcp"}:
+        raise ValueError("CE_MCP_TRANSPORT must be 'pipe' or 'tcp'.")
+    return transport
+
+
+def _parse_tcp_port(raw_value):
+    """Parse CE_MCP_PORT as a TCP port number."""
+    if raw_value is None or str(raw_value).strip() == "":
+        return DEFAULT_TCP_PORT
+    try:
+        port = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("CE_MCP_PORT must be an integer TCP port.") from exc
+    if not 1 <= port <= 65535:
+        raise ValueError("CE_MCP_PORT must be between 1 and 65535.")
+    return port
+
+
+CE_MCP_TRANSPORT = _parse_transport(os.environ.get("CE_MCP_TRANSPORT"))
+CE_MCP_HOST = os.environ.get("CE_MCP_HOST", DEFAULT_TCP_HOST).strip() or DEFAULT_TCP_HOST
+CE_MCP_PORT = _parse_tcp_port(os.environ.get("CE_MCP_PORT"))
+
 # ============================================================================
-# PIPE CLIENT
+# BRIDGE CLIENTS
 # ============================================================================
 
 class CEBridgeClient:
     def __init__(self):
-        self.handle = None
         self.timeout_seconds = CE_MCP_TIMEOUT_SECONDS
 
+    @property
+    def connected(self):
+        raise NotImplementedError
+
     def connect(self):
-        """Attempts to connect to the CE Named Pipe."""
-        try:
-            self.handle = win32file.CreateFile(
-                PIPE_NAME,
-                win32file.GENERIC_READ | win32file.GENERIC_WRITE,
-                0,
-                None,
-                win32file.OPEN_EXISTING,
-                0,
-                None
-            )
-            return True
-        except pywintypes.error as e:
-            # sys.stderr.write(f"[CEBridge] Connect Error: {e}\n")
-            return False
+        raise NotImplementedError
 
     def _exchange_once(self, req_json):
-        """Send one framed request and parse one framed response."""
-        header = struct.pack('<I', len(req_json))
-        win32file.WriteFile(self.handle, header)
-        win32file.WriteFile(self.handle, req_json)
+        raise NotImplementedError
 
-        resp_header_buffer = win32file.ReadFile(self.handle, 4)[1]
-        if len(resp_header_buffer) < 4:
-            raise ConnectionError("Incomplete response header from CE.")
+    def _endpoint_description(self):
+        return "Cheat Engine Bridge"
 
+    def _communication_error(self, error):
+        return error
+
+    def _decode_response(self, resp_header_buffer, resp_body_buffer):
         resp_len = struct.unpack('<I', resp_header_buffer)[0]
         if resp_len > MAX_RESPONSE_SIZE_BYTES:
             raise ConnectionError(f"Response too large: {resp_len} bytes")
-
-        resp_body_buffer = win32file.ReadFile(self.handle, resp_len)[1]
         try:
             return json.loads(resp_body_buffer.decode('utf-8'))
         except json.JSONDecodeError as exc:
@@ -236,9 +262,9 @@ class CEBridgeClient:
         last_error = None
         
         for attempt in range(max_retries):
-            if not self.handle:
+            if not self.connected:
                 if not self.connect():
-                    raise ConnectionError("Cheat Engine Bridge (v12/v99) is not running (Pipe not found).")
+                    raise ConnectionError(f"{self._endpoint_description()} is not reachable.")
 
             request = {
                 "jsonrpc": "2.0",
@@ -258,12 +284,9 @@ class CEBridgeClient:
                     
                 return response
 
-            except (pywintypes.error, ConnectionError, TimeoutError) as e:
+            except (OSError, ConnectionError, TimeoutError) as e:
                 self.close()
-                if isinstance(e, pywintypes.error):
-                    last_error = ConnectionError(f"Pipe Communication failed: {e}")
-                else:
-                    last_error = e
+                last_error = self._communication_error(e)
                 if attempt < max_retries - 1:
                     continue  # Retry
         
@@ -273,14 +296,157 @@ class CEBridgeClient:
         raise ConnectionError("Unknown communication error")
 
     def close(self):
+        raise NotImplementedError
+
+
+class CENamedPipeBridgeClient(CEBridgeClient):
+    def __init__(self):
+        super().__init__()
+        self.handle = None
+        if win32file is None or pywintypes is None:
+            raise RuntimeError(
+                "Named pipe transport requires Windows and pywin32. "
+                "Set CE_MCP_TRANSPORT=tcp when the MCP server cannot open the Windows pipe directly."
+            )
+
+    @property
+    def connected(self):
+        return self.handle is not None
+
+    def connect(self):
+        """Attempts to connect to the CE Named Pipe."""
+        try:
+            self.handle = win32file.CreateFile(
+                PIPE_NAME,
+                win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+                0,
+                None,
+                win32file.OPEN_EXISTING,
+                0,
+                None
+            )
+            return True
+        except pywintypes.error:
+            return False
+
+    def _endpoint_description(self):
+        return "Cheat Engine Bridge (v12/v99 pipe)"
+
+    def _communication_error(self, error):
+        if pywintypes is not None and isinstance(error, pywintypes.error):
+            return ConnectionError(f"Pipe communication failed: {error}")
+        return error
+
+    def _read_exact(self, size):
+        chunks = []
+        remaining = size
+        while remaining > 0:
+            try:
+                chunk = win32file.ReadFile(self.handle, remaining)[1]
+            except pywintypes.error as exc:
+                raise ConnectionError(f"Pipe communication failed: {exc}") from exc
+            if not chunk:
+                raise ConnectionError("Connection closed while reading from CE pipe.")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def _exchange_once(self, req_json):
+        """Send one framed request to the named pipe and parse one response."""
+        header = struct.pack('<I', len(req_json))
+        try:
+            win32file.WriteFile(self.handle, header)
+            win32file.WriteFile(self.handle, req_json)
+        except pywintypes.error as exc:
+            raise ConnectionError(f"Pipe communication failed: {exc}") from exc
+
+        resp_header_buffer = self._read_exact(4)
+        resp_len = struct.unpack('<I', resp_header_buffer)[0]
+        if resp_len > MAX_RESPONSE_SIZE_BYTES:
+            raise ConnectionError(f"Response too large: {resp_len} bytes")
+        resp_body_buffer = self._read_exact(resp_len)
+        return self._decode_response(resp_header_buffer, resp_body_buffer)
+
+    def close(self):
         if self.handle:
             try:
                 win32file.CloseHandle(self.handle)
-            except:
+            except Exception:
                 pass
             self.handle = None
 
-ce_client = CEBridgeClient()
+
+class CETcpBridgeClient(CEBridgeClient):
+    def __init__(self, host, port):
+        super().__init__()
+        self.host = host
+        self.port = port
+        self.sock = None
+
+    @property
+    def connected(self):
+        return self.sock is not None
+
+    def connect(self):
+        """Attempts to connect to the TCP relay."""
+        try:
+            connect_timeout = self.timeout_seconds if self.timeout_seconds is not None else None
+            self.sock = socket.create_connection((self.host, self.port), timeout=connect_timeout)
+            self.sock.settimeout(connect_timeout)
+            return True
+        except OSError:
+            self.close()
+            return False
+
+    def _endpoint_description(self):
+        return f"Cheat Engine Bridge TCP relay ({self.host}:{self.port})"
+
+    def _communication_error(self, error):
+        if isinstance(error, OSError):
+            return ConnectionError(f"TCP relay communication failed: {error}")
+        return error
+
+    def _read_exact(self, size):
+        chunks = []
+        remaining = size
+        while remaining > 0:
+            chunk = self.sock.recv(remaining)
+            if not chunk:
+                raise ConnectionError("Connection closed while reading from TCP relay.")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def _exchange_once(self, req_json):
+        """Send one framed request to the TCP relay and parse one response."""
+        header = struct.pack('<I', len(req_json))
+        self.sock.sendall(header + req_json)
+
+        resp_header_buffer = self._read_exact(4)
+        resp_len = struct.unpack('<I', resp_header_buffer)[0]
+        if resp_len > MAX_RESPONSE_SIZE_BYTES:
+            raise ConnectionError(f"Response too large: {resp_len} bytes")
+        resp_body_buffer = self._read_exact(resp_len)
+        return self._decode_response(resp_header_buffer, resp_body_buffer)
+
+    def close(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+
+
+def _create_bridge_client():
+    if CE_MCP_TRANSPORT == "tcp":
+        debug_log(f"Using TCP relay transport at {CE_MCP_HOST}:{CE_MCP_PORT}")
+        return CETcpBridgeClient(CE_MCP_HOST, CE_MCP_PORT)
+    debug_log("Using Windows named pipe transport")
+    return CENamedPipeBridgeClient()
+
+
+ce_client = _create_bridge_client()
 
 # ============================================================================
 # MCP SERVER - v12 IMPLEMENTATION

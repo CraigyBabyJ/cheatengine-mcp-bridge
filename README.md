@@ -93,7 +93,7 @@ pip install mcp pywin32
 ```
 
 > [!NOTE]
-> **Windows only** - Uses Named Pipes (`pywin32`)
+> Native pipe mode is **Windows only** because it uses Named Pipes (`pywin32`). Use TCP relay transport when the MCP server runs outside the Windows environment that hosts Cheat Engine and cannot open the named pipe directly.
 
 ---
 
@@ -134,6 +134,50 @@ args = ['C:\path\to\cheatengine-mcp-bridge\MCP_Server\mcp_cheatengine.py']
 ```
 
 Use single quotes for the Windows path so TOML treats backslashes literally.
+
+#### TCP relay transport
+
+The TCP relay lets `mcp_cheatengine.py` talk to Cheat Engine through a TCP socket instead of opening the Windows named pipe itself. Cheat Engine and the Lua bridge still run on Windows, while the MCP server can run anywhere that can reach the relay: another Windows process, a VM, a container, a Linux host, or a remote machine. This can also be used with WSL without changing the Lua bridge.
+
+1. On Windows, load `MCP_Server/ce_mcp_bridge.lua` in Cheat Engine as usual.
+2. On Windows, start the relay:
+
+```powershell
+python C:\path\to\cheatengine-mcp-bridge\MCP_Server\ce_tcp_relay.py --host 127.0.0.1 --port 9876
+```
+
+3. In the environment where the MCP server will run, install the MCP dependency without `pywin32`, then run/configure the MCP server with TCP transport:
+
+```bash
+python3 -m pip install -r MCP_Server/requirements-tcp.txt
+```
+
+```bash
+CE_MCP_TRANSPORT=tcp \
+CE_MCP_HOST=127.0.0.1 \
+CE_MCP_PORT=9876 \
+python3 /path/to/cheatengine-mcp-bridge/MCP_Server/mcp_cheatengine.py
+```
+
+For MCP client configs that support environment variables:
+
+```json
+{
+  "servers": {
+    "cheatengine": {
+      "command": "python3",
+      "args": ["/path/to/cheatengine-mcp-bridge/MCP_Server/mcp_cheatengine.py"],
+      "env": {
+        "CE_MCP_TRANSPORT": "tcp",
+        "CE_MCP_HOST": "127.0.0.1",
+        "CE_MCP_PORT": "9876"
+      }
+    }
+  }
+}
+```
+
+Set `--host` on the relay and `CE_MCP_HOST` on the MCP server to addresses that match your network setup. Keep the relay bound to trusted interfaces only, because anyone who can reach it can control the Cheat Engine bridge.
 
 ### 3. Verify Connection
 Use the `ping` tool to verify connectivity:
