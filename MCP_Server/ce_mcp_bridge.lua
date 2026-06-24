@@ -5,8 +5,9 @@
 local PIPE_NAME = "CE_MCP_Bridge_v99"
 local VERSION = "12.0.0"
 
--- Global State
-local serverState = {
+-- Global State (preserve across dofile reloads so StopMCPBridge can terminate old worker thread)
+if not serverState then
+serverState = {
     running = false,
     timer = nil,
     pipe = nil,
@@ -18,6 +19,7 @@ local serverState = {
     hw_bp_slots = {},      -- Hardware breakpoint slots (max 4)
     active_watches = {}    -- DBVM watch IDs for hypervisor-level tracing
 }
+end
 
 -- ============================================================================
 -- UTILITY FUNCTIONS
@@ -303,11 +305,29 @@ local function cleanupZombieState()
         end
     end
 
+    -- 5. Cleanup agent workflow scan sessions (Unit-27)
+    if serverState.value_hunts then
+        for name, entry in pairs(serverState.value_hunts) do
+            if entry then
+                if entry.fl then pcall(function() entry.fl.destroy() end) end
+                if entry.ms then pcall(function() entry.ms.destroy() end) end
+                cleaned.scans = cleaned.scans + 1
+            end
+        end
+        serverState.value_hunts = {}
+    end
+    -- 5. Clear memory snapshots (Unit-15)
+    if serverState.memSnapshots then
+        serverState.memSnapshots = nil
+    end
+
     -- Reset all tracking tables
     serverState.breakpoints = {}
     serverState.breakpoint_hits = {}
     serverState.hw_bp_slots = {}
     serverState.active_watches = {}
+    serverState.write_watch_sessions = {}
+    serverState.patch_sets = serverState.patch_sets or {}
 
     -- 4. Release any mapped memory MDL handles (Unit-21)
     if mappedMemoryMDL then
@@ -632,6 +652,55 @@ function cmd_enum_modules(params)
     return { success = true, total = total, offset = offset, limit = limit, returned = #page, modules = page, fallback_used = fallback_used }
 end
 
+-- Module snapshot: get detailed info about a single module (or all if no name provided)
+function cmd_get_module_snapshot(params)
+    local modName = params.module or params.name or nil
+    local pid = getOpenedProcessID()
+    local modules = enumModules(pid)
+    
+    if not modules or #modules == 0 then
+        modules = enumModules()
+    end
+    
+    if not modules or #modules == 0 then
+        return { success = false, error = "No modules found", error_code = "NO_PROCESS" }
+    end
+    
+    if modName then
+        -- Find specific module
+        for _, m in ipairs(modules) do
+            if m and m.Name and (m.Name:lower() == modName:lower() or m.Name:lower():match(modName:lower())) then
+                return {
+                    success = true,
+                    name = m.Name or "???",
+                    address = toHex(m.Address or 0),
+                    size = m.Size or 0,
+                    is_64bit = m.Is64Bit or false,
+                    path = m.PathToFile or "",
+                    entry_point = m.EntryPoint and toHex(m.EntryPoint) or nil
+                }
+            end
+        end
+        return { success = false, error = "Module not found: " .. modName, error_code = "NOT_FOUND" }
+    else
+        -- All modules as snapshot
+        local result = {}
+        for i, m in ipairs(modules) do
+            if m then
+                table.insert(result, {
+                    name = m.Name or "???",
+                    address = toHex(m.Address or 0),
+                    size = m.Size or 0,
+                    is_64bit = m.Is64Bit or false,
+                    path = m.PathToFile or "",
+                    entry_point = m.EntryPoint and toHex(m.EntryPoint) or nil
+                })
+            end
+        end
+        return { success = true, module_count = #result, modules = result }
+    end
+end
+
 function cmd_get_symbol_address(params)
     local symbol = params.symbol or params.name
     if not symbol then return { success = false, error = "No symbol name" } end
@@ -667,6 +736,87 @@ function cmd_read_memory(params)
         data = table.concat(hex, " "),
         bytes = bytes
     }
+end
+
+-- Multi-read: read from multiple addresses in a single call
+function cmd_multi_read(params)
+    local addresses = params.addresses
+    local size = params.size or 64
+    local types = params.types or nil  -- optional per-address type overrides: "byte","word","dword","qword","float","double"
+    
+    if not addresses or type(addresses) ~= "table" or #addresses == 0 then
+        return { success = false, error = "No addresses provided", error_code = "INVALID_PARAMS" }
+    end
+    
+    local results = {}
+    local errors = {}
+    
+    for i, addrSpec in ipairs(addresses) do
+        local addr, label
+        
+        -- Support both simple string addresses and {address, label} objects
+        if type(addrSpec) == "string" then
+            addr = getAddressSafe(addrSpec)
+            label = addrSpec
+        elseif type(addrSpec) == "table" then
+            addr = getAddressSafe(addrSpec.address)
+            label = addrSpec.label or tostring(addrSpec.address)
+        else
+            table.insert(errors, { index = i, input = tostring(addrSpec), error = "Invalid address specification" })
+            goto continue
+        end
+        
+        if not addr then
+            table.insert(errors, { index = i, input = label, error = "Invalid address" })
+            goto continue
+        end
+        
+        -- Read based on type (if specified) or default bytes
+        local typeOverride = types and types[i] or nil
+        local result
+        
+        if typeOverride then
+            local val
+            if typeOverride == "byte" then
+                local b = readBytes(addr, 1, true)
+                val = b and b[1] or nil
+            elseif typeOverride == "word" then
+                val = readSmallInteger(addr)
+            elseif typeOverride == "dword" then
+                val = readInteger(addr)
+            elseif typeOverride == "qword" then
+                val = readQword(addr)
+            elseif typeOverride == "float" then
+                val = readFloat(addr)
+            elseif typeOverride == "double" then
+                val = readDouble(addr)
+            else
+                table.insert(errors, { index = i, address = toHex(addr), error = "Unknown type: " .. tostring(typeOverride) })
+                goto continue
+            end
+            
+            result = { address = toHex(addr), label = label, type = typeOverride, value = val, hex = val ~= nil and toHex(val) or nil }
+        else
+            local readSize = math.max(1, math.min(size, 1048576))
+            local bytes = readBytes(addr, readSize, true)
+            
+            if not bytes then
+                table.insert(errors, { index = i, address = toHex(addr), error = "Failed to read" })
+                goto continue
+            end
+            
+            local hex = {}
+            for j, b in ipairs(bytes) do hex[j] = string.format("%02X", b) end
+            
+            result = { address = toHex(addr), label = label, type = "bytes", size = #bytes, data = table.concat(hex, " "), bytes = bytes }
+        end
+        
+        table.insert(results, result)
+        
+        ::continue::
+    end
+    
+    return { success = true, read_count = #results, error_count = #errors, results = results, errors = #errors > 0 and errors or nil }
 end
 
 function cmd_read_integer(params)
@@ -1023,6 +1173,68 @@ function cmd_write_memory(params)
     return { success = true, address = toHex(addr), bytes_written = #bytes }
 end
 
+-- Restore bytes: save original bytes, patch, then restore (or restore from saved copy)
+function cmd_restore_bytes(params)
+    local addr = params.address
+    local size = params.size or 16
+    local newBytes = params.bytes or nil  -- if provided, patch first then restore
+    
+    if type(addr) == "string" then addr = getAddressSafe(addr) end
+    if not addr then return { success = false, error = "Invalid address", error_code = "INVALID_PARAMS" } end
+    
+    local readSize = math.max(1, math.min(size, 1048576))
+    
+    -- Read original bytes
+    local original = readBytes(addr, readSize, true)
+    if not original then
+        return { success = false, error = "Failed to read at " .. toHex(addr), error_code = "INVALID_ADDRESS" }
+    end
+    
+    local originalHex = {}
+    for i, b in ipairs(original) do originalHex[i] = string.format("%02X", b) end
+    
+    -- If new bytes provided, patch first
+    local patched = false
+    if newBytes and #newBytes > 0 then
+        local ok, err = pcall(writeBytes, addr, newBytes)
+        if not ok then
+            return { success = false, error = "Patch write failed: " .. tostring(err), error_code = "INTERNAL_ERROR" }
+        end
+        patched = true
+    end
+    
+    -- Restore original bytes
+    local ok, err = pcall(writeBytes, addr, original)
+    if not ok then
+        return { success = false, error = "Restore write failed: " .. tostring(err), error_code = "INTERNAL_ERROR" }
+    end
+    
+    -- Verify restoration
+    local restored = readBytes(addr, readSize, true)
+    local match = false
+    if restored then
+        match = #restored == #original
+        if match then
+            for i = 1, #original do
+                if restored[i] ~= original[i] then
+                    match = false
+                    break
+                end
+            end
+        end
+    end
+    
+    return { 
+        success = true, 
+        address = toHex(addr), 
+        size = readSize, 
+        original_hex = table.concat(originalHex, " "),
+        was_patched = patched,
+        restored = match,
+        note = match and "Bytes successfully restored and verified" or "Restore may have failed - verify manually"
+    }
+end
+
 function cmd_write_string(params)
     local addr = params.address
     local str = params.value or params.string
@@ -1079,6 +1291,242 @@ function cmd_disassemble(params)
 
     local limit, offset, page, total = paginate(params, allInstructions, 100)
     return { success = true, start_address = toHex(addr), total = total, offset = offset, limit = limit, returned = #page, instructions = page }
+end
+
+-- Disassemble a range of addresses (start to end, not by instruction count)
+function cmd_disassemble_range(params)
+    local startAddr = params.address or params.start
+    local endAddr = params.end_address or params["end"]
+    local maxBytes = params.max_bytes or 65536  -- 64 KB safety limit
+    
+    if type(startAddr) == "string" then startAddr = getAddressSafe(startAddr) end
+    if type(endAddr) == "string" then endAddr = getAddressSafe(endAddr) end
+    if not startAddr then return { success = false, error = "Invalid start address", error_code = "INVALID_PARAMS" } end
+    if not endAddr then return { success = false, error = "Invalid end address", error_code = "INVALID_PARAMS" } end
+    if endAddr <= startAddr then return { success = false, error = "End address must be after start address", error_code = "INVALID_PARAMS" } end
+    
+    local range = endAddr - startAddr
+    if range > maxBytes then
+        return { success = false, error = "Range too large (max " .. maxBytes .. " bytes)", error_code = "INVALID_PARAMS" }
+    end
+    
+    local allInstructions = {}
+    local currentAddr = startAddr
+    
+    while currentAddr < endAddr do
+        local ok, disasm = pcall(disassemble, currentAddr)
+        if not ok or not disasm then break end
+        
+        local instSize = getInstructionSize(currentAddr) or 1
+        if instSize == 0 then break end
+        
+        local instBytes = readBytes(currentAddr, instSize, true) or {}
+        local bytesHex = {}
+        for _, b in ipairs(instBytes) do table.insert(bytesHex, string.format("%02X", b)) end
+        
+        table.insert(allInstructions, {
+            address = toHex(currentAddr),
+            offset = currentAddr - startAddr,
+            size = instSize,
+            bytes = table.concat(bytesHex, " "),
+            instruction = disasm
+        })
+        
+        currentAddr = currentAddr + instSize
+    end
+    
+    local limit, offset, page, total = paginate(params, allInstructions, 100)
+    return { 
+        success = true, 
+        start_address = toHex(startAddr), 
+        end_address = toHex(endAddr),
+        range_bytes = range, 
+        total = total, 
+        offset = offset, 
+        limit = limit, 
+        returned = #page, 
+        instructions = page 
+    }
+end
+
+-- Killer workflow: scan for a pattern, then analyze each match for hook candidates
+-- LIMITATIONS: function-boundary detection only searches backward 4KB for prologue
+-- patterns (55 8B EC / 55 48 89 E5 / 48 83 EC xx) and forward up to 4KB for C3/C2
+-- returns. Functions with non-standard prologues, tail calls, or multiple exit points
+-- may not be detected. AOB scan is synchronous and may block for broad patterns.
+function cmd_scan_analyze_hook(params)
+    local pattern = params.pattern
+    local maxMatches = params.max_matches or 10
+    local range = params.range or 64
+    local protection = params.protection or "+X"
+    
+    -- Hard caps to prevent pipe flooding
+    maxMatches = math.max(1, math.min(maxMatches, 50))
+    range = math.max(1, math.min(range, 256))
+    
+    if not pattern then
+        return { success = false, error = "No pattern provided", error_code = "INVALID_PARAMS" }
+    end
+    
+    -- Phase 1: AOB scan
+    local scanResults = AOBScan(pattern, protection)
+    if not scanResults then
+        return { success = true, pattern = pattern, total_matches = 0, analyzed = 0, matches = {} }
+    end
+    
+    local totalMatches = scanResults.Count
+    local analyzed = 0
+    local matches = {}
+    
+    for i = 0, math.min(scanResults.Count - 1, maxMatches - 1) do
+        local addrStr = scanResults.getString(i)
+        local matchAddr = tonumber(addrStr, 16)
+        if not matchAddr then
+            scanResults.destroy()
+            return { success = false, error = "Invalid address in scan results at index " .. i, error_code = "INTERNAL_ERROR" }
+        end
+        
+        -- Phase 2: find function boundaries
+        local funcStart, prologueType = findFunctionPrologue(matchAddr, 4096)
+        local funcEnd = nil
+        if funcStart then
+            for off = 0, 4096 do
+                local b = readBytes(funcStart + off, 1, false)
+                if b == 0xC3 or b == 0xC2 then
+                    funcEnd = funcStart + off
+                    break
+                end
+            end
+        end
+        
+        -- Phase 3: disassemble range around match and detect hook candidates
+        local hookCandidates = {}
+        local scanStart = math.max(1, matchAddr - range)
+        local scanEnd = matchAddr + range * 2  -- bias forward (more code after the pattern)
+        local curAddr = scanStart
+        
+        while curAddr < scanEnd do
+            local instSize = nil
+            local ok, result = pcall(getInstructionSize, curAddr)
+            if ok then instSize = result end
+            if not instSize or instSize == 0 then
+                curAddr = curAddr + 1
+                goto continue
+            end
+            
+            local ok, disasm = pcall(disassemble, curAddr)
+            if not ok or not disasm then
+                curAddr = curAddr + instSize
+                goto continue
+            end
+            
+            local instBytes = readBytes(curAddr, instSize, true) or {}
+            local bytesHex = {}
+            for _, b in ipairs(instBytes) do
+                table.insert(bytesHex, string.format("%02X", b))
+            end
+            
+            -- Detect hook candidate types
+            local candidateType = nil
+            local reason = nil
+            local b1 = instBytes[1] or 0
+            
+            -- Unconditional JMP: E9, EB, FF/4 (E4), FF/5 (E5)
+            if b1 == 0xE9 or b1 == 0xEB then
+                candidateType = "jmp"
+                reason = "Unconditional jump - can redirect to custom code"
+            elseif b1 == 0xFF then
+                local b2 = instBytes[2] or 0
+                if b2 == 0xE4 or b2 == 0xE5 then  -- FF/4, FF/5
+                    candidateType = "jmp"
+                    reason = "Indirect jump - can be patched to direct target"
+                end
+            end
+            
+            -- Conditional jumps: 7x series, 0F 8x
+            if not candidateType and b1 >= 0x70 and b1 <= 0x7F then
+                candidateType = "jcc"
+                reason = "Conditional jump - can be forced or redirected"
+            end
+            if not candidateType and b1 == 0x0F then
+                local b2 = instBytes[2] or 0
+                if b2 >= 0x80 and b2 <= 0x8F then
+                    candidateType = "jcc"
+                    reason = "Conditional jump - can be forced or redirected"
+                end
+            end
+            
+            -- CALL: E8, FF/2
+            if not candidateType and b1 == 0xE8 then
+                candidateType = "call"
+                reason = "Function call - can intercept or replace"
+            end
+            if not candidateType and b1 == 0xFF then
+                local b2 = instBytes[2] or 0
+                if b2 == 0xD2 or b2 == 0x12 then  -- FF/2
+                    candidateType = "call"
+                    reason = "Indirect call - can be patched to direct target"
+                end
+            end
+            
+            -- Function prologue: push rbp (55) followed by next instruction starting with 48 (x64) or 8B (x86/x64)
+            if not candidateType and b1 == 0x55 and instSize == 1 then
+                local nextB1 = readBytes(curAddr + 1, 1, false)
+                if nextB1 == 0x48 or nextB1 == 0x8B then
+                    candidateType = "prologue"
+                    reason = "Function prologue - ideal hook entry point"
+                end
+            end
+            
+            -- NOP sled: 90 90 ...
+            if not candidateType and b1 == 0x90 and instSize >= 4 then
+                candidateType = "nop_sled"
+                reason = "NOP padding - suitable for hook injection"
+            end
+            
+            -- Return: C3, C2
+            if not candidateType and (b1 == 0xC3 or b1 == 0xC2) then
+                candidateType = "ret"
+                reason = "Function return - can hook for epilogue analysis"
+            end
+            
+            if candidateType then
+                table.insert(hookCandidates, {
+                    address = toHex(curAddr),
+                    type = candidateType,
+                    instruction = disasm,
+                    bytes = table.concat(bytesHex, " "),
+                    size = instSize,
+                    reason = reason
+                })
+            end
+            
+            curAddr = curAddr + instSize
+            
+            ::continue::
+        end
+        
+        table.insert(matches, {
+            match_address = toHex(matchAddr),
+            function_start = funcStart and toHex(funcStart) or nil,
+            function_end = funcEnd and toHex(funcEnd) or nil,
+            prologue_type = prologueType or nil,
+            hook_candidates = hookCandidates,
+            candidate_count = #hookCandidates
+        })
+        
+        analyzed = analyzed + 1
+    end
+    
+    scanResults.destroy()
+    
+    return {
+        success = true,
+        pattern = pattern,
+        total_matches = totalMatches,
+        analyzed = analyzed,
+        matches = matches
+    }
 end
 
 function cmd_get_instruction_info(params)
@@ -4023,6 +4471,973 @@ function cmd_compare_memory(params)
     end
 end
 
+-- >>> BEGIN UNIT-15 Memory Snapshot & Diff <<<
+
+-- serverState.memSnapshots is a table of named snapshots: { address, size, data, timestamp }
+
+function cmd_memory_snapshot(params)
+    local pid = getOpenedProcessID()
+    if not pid or pid == 0 then return { success = false, error = "No process attached" } end
+
+    local name = params.name or "default"
+    local address = params.address
+    local size = params.size or 256
+
+    if not address then return { success = false, error = "Missing address" } end
+    if type(address) == "string" then address = getAddressSafe(address) end
+    if not address then return { success = false, error = "Invalid address" } end
+
+    local ok, data = pcall(readBytes, address, size, true)
+    if not ok or not data then
+        return { success = false, error = "Failed to read memory: " .. tostring(data) }
+    end
+
+    if not serverState.memSnapshots then serverState.memSnapshots = {} end
+    serverState.memSnapshots[name] = {
+        address = address,
+        size = size,
+        data = data,
+        timestamp = os.time()
+    }
+
+    local checksum = ""
+    local ok2, md5 = pcall(md5Sum, data)
+    if ok2 then checksum = md5 end
+
+    return {
+        success = true,
+        name = name,
+        address = toHex(address),
+        size = size,
+        checksum = checksum,
+        timestamp = serverState.memSnapshots[name].timestamp
+    }
+end
+
+function cmd_memory_diff(params)
+    local name = params.name or "default"
+
+    if not serverState.memSnapshots or not serverState.memSnapshots[name] then
+        return { success = false, error = "No snapshot with name '" .. name .. "' found", error_code = "NOT_FOUND" }
+    end
+
+    local snap = serverState.memSnapshots[name]
+    local snapAddr = snap.address
+    local snapSize = snap.size
+    local snapData = snap.data
+
+    -- Re-read current memory
+    local ok, currentData = pcall(readBytes, snapAddr, snapSize, true)
+    if not ok or not currentData then
+        return { success = false, error = "Failed to read current memory: " .. tostring(currentData) } end
+
+    -- Compare byte-by-byte
+    local equal = true
+    local firstDiff = -1
+    local diffCount = 0
+    local diffs = {}
+
+    for i = 1, snapSize do
+        local oldByte = snapData[i]
+        local newByte = currentData[i]
+        if oldByte ~= newByte then
+            diffCount = diffCount + 1
+            if firstDiff == -1 then
+                firstDiff = i - 1
+            end
+            -- Report first 20 diffs with context
+            if #diffs < 20 then
+                table.insert(diffs, {
+                    offset = i - 1,
+                    address = toHex(snapAddr + i - 1),
+                    old_value = toHex(oldByte),
+                    new_value = toHex(newByte)
+                })
+            end
+        end
+    end
+
+    return {
+        success = true,
+        name = name,
+        equal = firstDiff == -1,
+        first_diff = firstDiff,
+        diff_count = diffCount,
+        diffs = diffs,
+        snapshot_timestamp = snap.timestamp
+    }
+end
+
+function cmd_memory_snapshot_list(params)
+    if not serverState.memSnapshots then
+        return { success = true, count = 0, snapshots = {} }
+    end
+
+    local snapshots = {}
+    for k, v in pairs(serverState.memSnapshots) do
+        table.insert(snapshots, {
+            name = k,
+            address = toHex(v.address),
+            size = v.size,
+            timestamp = v.timestamp
+        })
+    end
+
+    return { success = true, count = #snapshots, snapshots = snapshots }
+end
+
+function cmd_memory_snapshot_delete(params)
+    local name = params.name or "default"
+
+    if not serverState.memSnapshots or not serverState.memSnapshots[name] then
+        return { success = false, error = "No snapshot with name '" .. name .. "' found", error_code = "NOT_FOUND" }
+    end
+
+    serverState.memSnapshots[name] = nil
+    return { success = true, name = name }
+end
+
+-- >>> END UNIT-15 <<<
+
+-- >>> BEGIN UNIT-27 Agent Workflow Tools <<<
+
+local function workflowEnsureState()
+    serverState.value_hunts = serverState.value_hunts or {}
+    serverState.write_watch_sessions = serverState.write_watch_sessions or {}
+    serverState.patch_sets = serverState.patch_sets or {}
+end
+
+local function workflowParseBytes(value)
+    if type(value) == "table" then
+        local out = {}
+        for i, b in ipairs(value) do
+            local n = tonumber(b)
+            if not n or n < 0 or n > 255 then return nil, "Invalid byte at index " .. tostring(i) end
+            out[#out + 1] = math.floor(n)
+        end
+        return out, nil
+    end
+
+    if type(value) ~= "string" then return nil, "Bytes must be a table or hex string" end
+    local out = {}
+    for token in value:gmatch("%S+") do
+        if token ~= "??" and token ~= "?" then
+            token = token:gsub("^0x", ""):gsub("^0X", "")
+            local n = tonumber(token, 16)
+            if not n or n < 0 or n > 255 then return nil, "Invalid byte token: " .. tostring(token) end
+            out[#out + 1] = n
+        end
+    end
+    return out, nil
+end
+
+local function workflowBytesToHex(bytes)
+    local parts = {}
+    for i, b in ipairs(bytes or {}) do parts[#parts + 1] = string.format("%02X", b or 0) end
+    return table.concat(parts, " ")
+end
+
+local function workflowReadBytes(addr, size)
+    local ok, data = pcall(readBytes, addr, size, true)
+    if not ok or not data then return nil, tostring(data) end
+    return data, nil
+end
+
+local function workflowReadTyped(addr, valueType)
+    valueType = (valueType or "dword"):lower()
+    local ok, value
+    if valueType == "byte" then ok, value = pcall(readBytes, addr, 1, false)
+    elseif valueType == "word" or valueType == "2bytes" then ok, value = pcall(readSmallInteger, addr)
+    elseif valueType == "dword" or valueType == "4bytes" or valueType == "int" then ok, value = pcall(readInteger, addr)
+    elseif valueType == "qword" or valueType == "8bytes" then ok, value = pcall(readQword, addr)
+    elseif valueType == "float" or valueType == "single" then ok, value = pcall(readFloat, addr)
+    elseif valueType == "double" then ok, value = pcall(readDouble, addr)
+    elseif valueType == "pointer" or valueType == "ptr" then ok, value = pcall(readPointer, addr)
+    else return nil, "Unknown type: " .. tostring(valueType) end
+    if not ok then return nil, tostring(value) end
+    if valueType == "pointer" or valueType == "ptr" then return toHex(value), nil end
+    return value, nil
+end
+
+local function workflowWriteTyped(addr, valueType, value)
+    valueType = (valueType or "dword"):lower()
+    local ok, err
+    if valueType == "byte" then ok, err = pcall(writeBytes, addr, tonumber(value) or 0)
+    elseif valueType == "word" or valueType == "2bytes" then ok, err = pcall(writeSmallInteger, addr, tonumber(value) or 0)
+    elseif valueType == "dword" or valueType == "4bytes" or valueType == "int" then ok, err = pcall(writeInteger, addr, tonumber(value) or 0)
+    elseif valueType == "qword" or valueType == "8bytes" then ok, err = pcall(writeQword, addr, tonumber(value) or 0)
+    elseif valueType == "float" or valueType == "single" then ok, err = pcall(writeFloat, addr, tonumber(value) or 0)
+    elseif valueType == "double" then ok, err = pcall(writeDouble, addr, tonumber(value) or 0)
+    else return false, "Unknown type: " .. tostring(valueType) end
+    if not ok then return false, tostring(err) end
+    return true, nil
+end
+
+local function workflowGetSymbol(addr)
+    local ok, symbol = pcall(function() return getNameFromAddress(addr, true, true, false) end)
+    if ok and symbol and symbol ~= "" then return symbol end
+    return toHex(addr)
+end
+
+local function workflowScanExact(value, valueType, maxResults, protection)
+    local varType = vtDword
+    valueType = (valueType or "dword"):lower()
+    if valueType == "byte" then varType = vtByte
+    elseif valueType == "word" or valueType == "2bytes" then varType = vtWord
+    elseif valueType == "qword" or valueType == "8bytes" or valueType == "pointer" or valueType == "ptr" then varType = vtQword
+    elseif valueType == "float" or valueType == "single" then varType = vtSingle
+    elseif valueType == "double" then varType = vtDouble end
+
+    local ms = createMemScan()
+    ms.firstScan(soExactValue, varType, rtRounded, tostring(value), nil, 0, 0x7FFFFFFFFFFFFFFF, protection or "+W-C", fsmNotAligned, "1", false, false, false, false)
+    ms.waitTillDone()
+    local fl = createFoundList(ms)
+    fl.initialize()
+    local total = fl.getCount()
+    local addresses = {}
+    local endIdx = math.min(total, maxResults or 100) - 1
+    for i = 0, endIdx do
+        local addrStr = fl.getAddress(i)
+        if addrStr and not addrStr:match("^0x") and not addrStr:match("^0X") then addrStr = "0x" .. addrStr end
+        addresses[#addresses + 1] = addrStr
+    end
+    pcall(function() fl.destroy() end)
+    pcall(function() ms.destroy() end)
+    return total, addresses
+end
+
+local function workflowDisableWriteWatchSession(name)
+    workflowEnsureState()
+    local session = serverState.write_watch_sessions[name]
+    if not session then return false, 0 end
+    local removed = 0
+    for _, bpId in ipairs(session.breakpoint_ids or {}) do
+        local bp = serverState.breakpoints and serverState.breakpoints[bpId]
+        if bp and bp.address then
+            pcall(function() debug_removeBreakpoint(bp.address) end)
+            if bp.slot then serverState.hw_bp_slots[bp.slot] = nil end
+            serverState.breakpoints[bpId] = nil
+            removed = removed + 1
+        end
+        if serverState.breakpoint_hits then serverState.breakpoint_hits[bpId] = nil end
+    end
+    session.breakpoint_ids = {}
+    session.active = false
+    return true, removed
+end
+
+local function workflowStopWriteWatchSession(name)
+    local existed, removed = workflowDisableWriteWatchSession(name)
+    if not existed then return false, 0 end
+    serverState.write_watch_sessions[name] = nil
+    return true, removed
+end
+
+function cmd_workflow_value_hunt_start(params)
+    local err = requireProcess(); if err then return err end
+    workflowEnsureState()
+    local name = params.name or "hunt"
+    local value = params.value
+    local valueType = params.type or params.value_type or "dword"
+    local protection = params.protection or "+W-C"
+    if value == nil then return { success = false, error = "Missing value", error_code = "INVALID_PARAMS" } end
+
+    if serverState.value_hunts[name] then
+        local old = serverState.value_hunts[name]
+        if old.fl then pcall(function() old.fl.destroy() end) end
+        if old.ms then pcall(function() old.ms.destroy() end) end
+    end
+
+    local varType = vtDword
+    local vt = valueType:lower()
+    if vt == "byte" then varType = vtByte
+    elseif vt == "word" or vt == "2bytes" then varType = vtWord
+    elseif vt == "qword" or vt == "8bytes" then varType = vtQword
+    elseif vt == "float" or vt == "single" then varType = vtSingle
+    elseif vt == "double" then varType = vtDouble
+    elseif vt == "string" then varType = vtString end
+
+    local ms = createMemScan()
+    ms.firstScan(soExactValue, varType, rtRounded, tostring(value), nil, 0, 0x7FFFFFFFFFFFFFFF, protection, fsmNotAligned, "1", false, false, false, false)
+    ms.waitTillDone()
+    local fl = createFoundList(ms)
+    fl.initialize()
+    local count = fl.getCount()
+    serverState.value_hunts[name] = { ms = ms, fl = fl, value_type = valueType, protection = protection, created_at = os.time(), last_count = count }
+    return { success = true, name = name, value = tostring(value), value_type = valueType, count = count }
+end
+
+function cmd_workflow_value_hunt_refine(params)
+    workflowEnsureState()
+    local name = params.name or "hunt"
+    local hunt = serverState.value_hunts[name]
+    if not hunt then return { success = false, error = "No value hunt named '" .. name .. "'", error_code = "NOT_FOUND" } end
+    local scanType = params.scan_type or "exact"
+    local value = params.value
+    local scanOpt = soExactValue
+    if scanType == "increased" then scanOpt = soIncreasedValue
+    elseif scanType == "decreased" then scanOpt = soDecreasedValue
+    elseif scanType == "changed" then scanOpt = soChanged
+    elseif scanType == "unchanged" then scanOpt = soUnchanged
+    elseif scanType == "bigger" then scanOpt = soBiggerThan
+    elseif scanType == "smaller" then scanOpt = soSmallerThan end
+
+    if scanOpt == soExactValue or scanOpt == soBiggerThan or scanOpt == soSmallerThan then
+        if value == nil then return { success = false, error = "scan_type requires value: " .. scanType, error_code = "INVALID_PARAMS" } end
+        hunt.ms.nextScan(scanOpt, rtRounded, tostring(value), nil, false, false, false, false, false)
+    else
+        hunt.ms.nextScan(scanOpt, rtRounded, nil, nil, false, false, false, false, false)
+    end
+    hunt.ms.waitTillDone()
+    if hunt.fl then pcall(function() hunt.fl.destroy() end) end
+    hunt.fl = createFoundList(hunt.ms)
+    hunt.fl.initialize()
+    hunt.last_count = hunt.fl.getCount()
+    return { success = true, name = name, scan_type = scanType, count = hunt.last_count }
+end
+
+function cmd_workflow_value_hunt_results(params)
+    workflowEnsureState()
+    local name = params.name or "hunt"
+    local hunt = serverState.value_hunts[name]
+    if not hunt or not hunt.fl then return { success = false, error = "No value hunt named '" .. name .. "'", error_code = "NOT_FOUND" } end
+    local limit = math.max(1, math.min(params.limit or 100, 10000))
+    local offset = math.max(0, params.offset or 0)
+    local total = hunt.fl.getCount()
+    local results = {}
+    for i = offset, math.min(offset + limit, total) - 1 do
+        local addrStr = hunt.fl.getAddress(i)
+        if addrStr and not addrStr:match("^0x") and not addrStr:match("^0X") then addrStr = "0x" .. addrStr end
+        results[#results + 1] = { address = addrStr, value = hunt.fl.getValue(i) }
+    end
+    return { success = true, name = name, total = total, offset = offset, limit = limit, returned = #results, results = results }
+end
+
+function cmd_workflow_value_hunt_destroy(params)
+    workflowEnsureState()
+    local name = params.name or "hunt"
+    local hunt = serverState.value_hunts[name]
+    if not hunt then return { success = false, error = "No value hunt named '" .. name .. "'", error_code = "NOT_FOUND" } end
+    if hunt.fl then pcall(function() hunt.fl.destroy() end) end
+    if hunt.ms then pcall(function() hunt.ms.destroy() end) end
+    serverState.value_hunts[name] = nil
+    return { success = true, name = name, destroyed = true }
+end
+
+function cmd_workflow_write_watch_start(params)
+    local err = requireProcess(); if err then return err end
+    workflowEnsureState()
+    local name = params.name or ("watch_" .. tostring(os.time()))
+    local addresses = params.addresses or (params.address and { params.address }) or {}
+    local size = params.size or 4
+    local accessType = params.access_type or "w"
+    local maxHits = params.max_hits or 50
+    local captureStackFlag = params.capture_stack or false
+    local stackDepth = params.stack_depth or 16
+    local autoRemove = params.auto_remove ~= false
+    if #addresses == 0 then return { success = false, error = "Missing address or addresses", error_code = "INVALID_PARAMS" } end
+    if #addresses > 4 then return { success = false, error = "Hardware watch sessions can use at most 4 addresses", error_code = "OUT_OF_RESOURCES" } end
+    workflowStopWriteWatchSession(name)
+
+    local session = { name = name, breakpoint_ids = {}, hits = {}, summary = {}, started_at = os.time(), max_hits = maxHits, total_hits = 0, active = true }
+    serverState.write_watch_sessions[name] = session
+    local created = {}
+    local bpType = bptWrite
+    if accessType == "r" or accessType == "rw" then bpType = bptAccess end
+
+    for index, rawAddr in ipairs(addresses) do
+        local addr = rawAddr
+        if type(addr) == "string" then addr = getAddressSafe(addr) end
+        if not addr then workflowStopWriteWatchSession(name); return { success = false, error = "Invalid address: " .. tostring(rawAddr), error_code = "INVALID_ADDRESS" } end
+        local slot = nil
+        for i = 1, 4 do if not serverState.hw_bp_slots[i] then slot = i; break end end
+        if not slot then workflowStopWriteWatchSession(name); return { success = false, error = "No free hardware breakpoint slots", error_code = "OUT_OF_RESOURCES" } end
+        clearGhostBpSlot(addr)
+        pcall(function() debug_removeBreakpoint(addr) end)
+        local bpId = name .. ":" .. tostring(index) .. ":" .. toHex(addr)
+        serverState.breakpoint_hits[bpId] = {}
+        debug_setBreakpoint(addr, size, bpType, bpmDebugRegister, function()
+            local arch = getArchInfo()
+            local ip = arch.instPtr
+            local inst = "???"
+            if ip then local okInst, text = pcall(disassemble, ip); if okInst and text then inst = text end end
+            local symbol = ip and workflowGetSymbol(ip) or "nil"
+            local valueBytes = workflowReadBytes(addr, size)
+            local hit = {
+                id = bpId,
+                session = name,
+                watched_address = toHex(addr),
+                watched_index = index,
+                timestamp = os.time(),
+                instruction_pointer = ip and toHex(ip) or nil,
+                instruction_symbol = symbol,
+                instruction = inst,
+                value_bytes = valueBytes and workflowBytesToHex(valueBytes) or nil,
+                registers = captureRegisters(),
+                arch = arch.is64bit and "x64" or "x86"
+            }
+            if captureStackFlag then hit.stack = captureStack(stackDepth) end
+            session.total_hits = session.total_hits + 1
+            session.hits[#session.hits + 1] = hit
+            serverState.breakpoint_hits[bpId][#serverState.breakpoint_hits[bpId] + 1] = hit
+            local key = symbol .. " | " .. inst
+            if not session.summary[key] then session.summary[key] = { instruction_symbol = symbol, instruction = inst, count = 0, watched_addresses = {} } end
+            session.summary[key].count = session.summary[key].count + 1
+            session.summary[key].watched_addresses[toHex(addr)] = true
+            if autoRemove and session.total_hits >= maxHits then workflowDisableWriteWatchSession(name) end
+            debug_continueFromBreakpoint(co_run)
+            return 1
+        end)
+        serverState.hw_bp_slots[slot] = { id = bpId, address = addr }
+        serverState.breakpoints[bpId] = { address = addr, slot = slot, type = "workflow_write_watch", session = name }
+        session.breakpoint_ids[#session.breakpoint_ids + 1] = bpId
+        created[#created + 1] = { id = bpId, address = toHex(addr), slot = slot }
+    end
+    return { success = true, name = name, count = #created, breakpoints = created, max_hits = maxHits }
+end
+
+function cmd_workflow_write_watch_poll(params)
+    workflowEnsureState()
+    local name = params.name
+    if not name then return { success = false, error = "Missing name", error_code = "INVALID_PARAMS" } end
+    local session = serverState.write_watch_sessions[name]
+    if not session then return { success = false, error = "No write-watch session named '" .. name .. "'", error_code = "NOT_FOUND" } end
+    local hits = session.hits or {}
+    local summary = {}
+    for _, entry in pairs(session.summary or {}) do
+        local addrs = {}
+        for a, _ in pairs(entry.watched_addresses or {}) do addrs[#addrs + 1] = a end
+        summary[#summary + 1] = { instruction_symbol = entry.instruction_symbol, instruction = entry.instruction, count = entry.count, watched_addresses = addrs }
+    end
+    table.sort(summary, function(a, b) return (a.count or 0) > (b.count or 0) end)
+    local limit, offset, page, total = paginate(params, hits, 100)
+    if params.clear then session.hits = {} end
+    return { success = true, name = name, total = total, offset = offset, limit = limit, returned = #page, hits = page, summary = summary, active = session.active ~= false, active_breakpoints = #(session.breakpoint_ids or {}) }
+end
+
+function cmd_workflow_write_watch_stop(params)
+    local name = params.name
+    if not name then return { success = false, error = "Missing name", error_code = "INVALID_PARAMS" } end
+    local existed, removed = workflowStopWriteWatchSession(name)
+    if not existed then return { success = false, error = "No write-watch session named '" .. name .. "'", error_code = "NOT_FOUND" } end
+    return { success = true, name = name, removed = removed }
+end
+
+function cmd_workflow_pointer_chain_find(params)
+    local err = requireProcess(); if err then return err end
+    local target = params.target_address or params.address
+    if not target then return { success = false, error = "Missing target_address", error_code = "INVALID_PARAMS" } end
+    if type(target) == "string" then target = getAddressSafe(target) end
+    if not target then return { success = false, error = "Invalid target address", error_code = "INVALID_ADDRESS" } end
+    local maxDepth = math.max(1, math.min(params.max_depth or 3, 5))
+    local maxOffset = math.max(0, math.min(params.max_offset or 0x400, 0x5000))
+    local step = math.max(1, params.step or 4)
+    local maxResults = math.max(1, math.min(params.max_results or 50, 500))
+    local perScanLimit = math.max(1, math.min(params.per_scan_limit or 32, 200))
+    local ptrType = targetIs64Bit() and "qword" or "dword"
+    local frontier = { { address = target, offsets = {}, path = { toHex(target) } } }
+    local results = {}
+    local seen = {}
+
+    for depth = 1, maxDepth do
+        local nextFrontier = {}
+        for _, node in ipairs(frontier) do
+            for off = 0, maxOffset, step do
+                local pointerValue = node.address - off
+                if pointerValue and pointerValue > 0 then
+                    local total, refs = workflowScanExact(tostring(pointerValue), ptrType, perScanLimit, params.protection or "+W-C")
+                    for _, refStr in ipairs(refs) do
+                        local refAddr = getAddressSafe(refStr)
+                        if refAddr then
+                            local offsets = { off }
+                            for _, existing in ipairs(node.offsets) do offsets[#offsets + 1] = existing end
+                            local path = { toHex(refAddr) }
+                            for _, p in ipairs(node.path) do path[#path + 1] = p end
+                            local rootSymbol = workflowGetSymbol(refAddr)
+                            local key = refStr .. ":" .. table.concat(offsets, ",")
+                            if not seen[key] then
+                                seen[key] = true
+                                local chain = { root = toHex(refAddr), root_symbol = rootSymbol, offsets = offsets, depth = depth, path = path, score = 0 }
+                                if rootSymbol and not rootSymbol:match("^0x") then chain.score = chain.score + 100 end
+                                chain.score = chain.score - (#offsets * 5)
+                                results[#results + 1] = chain
+                                nextFrontier[#nextFrontier + 1] = { address = refAddr, offsets = offsets, path = path }
+                                if #results >= maxResults then break end
+                            end
+                        end
+                    end
+                    if #results >= maxResults then break end
+                end
+            end
+            if #results >= maxResults then break end
+        end
+        frontier = nextFrontier
+        if #frontier == 0 or #results >= maxResults then break end
+    end
+    table.sort(results, function(a, b) return (a.score or 0) > (b.score or 0) end)
+    return { success = true, target_address = toHex(target), pointer_type = ptrType, count = #results, chains = results }
+end
+
+function cmd_workflow_patch_define(params)
+    workflowEnsureState()
+    local name = params.name or "default"
+    local patches = params.patches or (params.address and { params }) or {}
+    if #patches == 0 then return { success = false, error = "Missing patches", error_code = "INVALID_PARAMS" } end
+    local defs = {}
+    for i, patch in ipairs(patches) do
+        local addr = patch.address
+        if type(addr) == "string" then addr = getAddressSafe(addr) end
+        if not addr then return { success = false, error = "Invalid patch address at index " .. tostring(i), error_code = "INVALID_ADDRESS" } end
+        local patched, err1 = workflowParseBytes(patch.patched_bytes or patch.bytes)
+        if not patched then return { success = false, error = err1, error_code = "INVALID_PARAMS" } end
+        local original, err2 = nil, nil
+        if patch.original_bytes then original, err2 = workflowParseBytes(patch.original_bytes) end
+        if patch.original_bytes and not original then return { success = false, error = err2, error_code = "INVALID_PARAMS" } end
+        defs[#defs + 1] = { name = patch.name or ("patch_" .. tostring(i)), address = addr, original_bytes = original, patched_bytes = patched, size = #patched }
+    end
+    serverState.patch_sets[name] = { name = name, patches = defs, created_at = os.time() }
+    return { success = true, name = name, count = #defs }
+end
+
+function cmd_workflow_patch_status(params)
+    workflowEnsureState()
+    local name = params.name or "default"
+    local set = serverState.patch_sets[name]
+    if not set then return { success = false, error = "No patch set named '" .. name .. "'", error_code = "NOT_FOUND" } end
+    local patches = {}
+    for _, patch in ipairs(set.patches) do
+        local size = patch.original_bytes and #patch.original_bytes or #patch.patched_bytes
+        local current = workflowReadBytes(patch.address, size)
+        local currentHex = current and workflowBytesToHex(current) or nil
+        local originalHex = patch.original_bytes and workflowBytesToHex(patch.original_bytes) or nil
+        local patchedHex = workflowBytesToHex(patch.patched_bytes)
+        local state = "unknown"
+        if currentHex == patchedHex then state = "patched"
+        elseif originalHex and currentHex == originalHex then state = "original" end
+        patches[#patches + 1] = { name = patch.name, address = toHex(patch.address), current_bytes = currentHex, original_bytes = originalHex, patched_bytes = patchedHex, state = state }
+    end
+    return { success = true, name = name, count = #patches, patches = patches }
+end
+
+function cmd_workflow_patch_apply(params)
+    workflowEnsureState()
+    local name = params.name or "default"
+    local set = serverState.patch_sets[name]
+    if not set then return { success = false, error = "No patch set named '" .. name .. "'", error_code = "NOT_FOUND" } end
+    local applied = {}
+    for _, patch in ipairs(set.patches) do
+        if patch.original_bytes then
+            local current = workflowReadBytes(patch.address, #patch.original_bytes)
+            local currentHex = current and workflowBytesToHex(current) or nil
+            local originalHex = workflowBytesToHex(patch.original_bytes)
+            local patchedHex = workflowBytesToHex(patch.patched_bytes)
+            if currentHex ~= originalHex and currentHex ~= patchedHex and params.force ~= true then
+                return { success = false, error = "Original bytes mismatch at " .. toHex(patch.address), error_code = "INVALID_PARAMS", current_bytes = currentHex, expected_bytes = originalHex }
+            end
+        end
+        local ok, err = pcall(writeBytes, patch.address, patch.patched_bytes)
+        if not ok then return { success = false, error = "Patch failed at " .. toHex(patch.address) .. ": " .. tostring(err), error_code = "INTERNAL_ERROR" } end
+        applied[#applied + 1] = { name = patch.name, address = toHex(patch.address), bytes = workflowBytesToHex(patch.patched_bytes) }
+    end
+    return { success = true, name = name, applied = #applied, patches = applied }
+end
+
+function cmd_workflow_patch_restore(params)
+    workflowEnsureState()
+    local name = params.name or "default"
+    local set = serverState.patch_sets[name]
+    if not set then return { success = false, error = "No patch set named '" .. name .. "'", error_code = "NOT_FOUND" } end
+    local restored = {}
+    for _, patch in ipairs(set.patches) do
+        if not patch.original_bytes then return { success = false, error = "Patch has no original bytes: " .. patch.name, error_code = "INVALID_PARAMS" } end
+        local ok, err = pcall(writeBytes, patch.address, patch.original_bytes)
+        if not ok then return { success = false, error = "Restore failed at " .. toHex(patch.address) .. ": " .. tostring(err), error_code = "INTERNAL_ERROR" } end
+        restored[#restored + 1] = { name = patch.name, address = toHex(patch.address), bytes = workflowBytesToHex(patch.original_bytes) }
+    end
+    return { success = true, name = name, restored = #restored, patches = restored }
+end
+
+function cmd_workflow_read_typed_batch(params)
+    local err = requireProcess(); if err then return err end
+    local reads = params.reads or params.addresses or {}
+    if #reads == 0 then return { success = false, error = "Missing reads", error_code = "INVALID_PARAMS" } end
+    local results = {}
+    for i, item in ipairs(reads) do
+        local addr = item
+        local valueType = params.type or "dword"
+        if type(item) == "table" then
+            addr = item.address
+            valueType = item.type or valueType
+        end
+        if type(addr) == "string" then addr = getAddressSafe(addr) end
+        if addr then
+            local value, readErr = workflowReadTyped(addr, valueType)
+            results[#results + 1] = { index = i, address = toHex(addr), type = valueType, value = value, error = readErr }
+        else
+            results[#results + 1] = { index = i, error = "Invalid address" }
+        end
+    end
+    return { success = true, count = #results, results = results }
+end
+
+function cmd_workflow_write_typed_batch(params)
+    local err = requireProcess(); if err then return err end
+    local writes = params.writes or {}
+    if #writes == 0 then return { success = false, error = "Missing writes", error_code = "INVALID_PARAMS" } end
+    local results = {}
+    for i, item in ipairs(writes) do
+        local addr = item.address
+        local valueType = item.type or params.type or "dword"
+        if type(addr) == "string" then addr = getAddressSafe(addr) end
+        if addr then
+            local before = nil
+            if params.verify ~= false then before = workflowReadTyped(addr, valueType) end
+            local ok, writeErr = workflowWriteTyped(addr, valueType, item.value)
+            local after = nil
+            if ok and params.verify ~= false then after = workflowReadTyped(addr, valueType) end
+            results[#results + 1] = { index = i, address = toHex(addr), type = valueType, value = item.value, success = ok, error = writeErr, before = before, after = after }
+        else
+            results[#results + 1] = { index = i, success = false, error = "Invalid address" }
+        end
+    end
+    return { success = true, count = #results, results = results }
+end
+
+-- >>> END UNIT-27 <<<
+-- >>> BEGIN UNIT-16 Function Analysis & Xref Tools <<<
+
+function cmd_function_info(params)
+    local addr = params.address
+    local maxSearch = params.max_search or 4096
+
+    if type(addr) == "string" then addr = getAddressSafe(addr) end
+    if not addr then return { success = false, error = "Invalid address" } end
+
+    local is64 = targetIs64Bit()
+
+    -- Find function boundaries
+    local funcStart, prologueType = findFunctionPrologue(addr, maxSearch)
+    local funcEnd = nil
+
+    if funcStart then
+        for offset = 0, maxSearch do
+            local b = readBytes(funcStart + offset, 1, false)
+            if b == 0xC3 or b == 0xC2 then
+                funcEnd = funcStart + offset
+                break
+            end
+        end
+    end
+
+    -- Detect calling convention from prologue
+    local callingConvention = "unknown"
+    local paramCount = 0
+    local stackFrameSize = 0
+
+    if funcStart and prologueType then
+        -- Analyze first few bytes to detect convention
+        local bytes = readBytes(funcStart, 16, true)
+        if bytes then
+            -- x64: check for shadow space allocation (40h = 64 bytes)
+            if is64 then
+                callingConvention = "ms_x64"
+                paramCount = 4  -- rcx, rdx, r8, r9
+                -- Check for stack space allocation
+                for i = 1, math.min(#bytes, 12) do
+                    if bytes[i] == 0x48 and bytes[i+1] == 0x83 and bytes[i+2] == 0xEC then
+                        stackFrameSize = bytes[i+3]
+                        break
+                    end
+                    if bytes[i] == 0x48 and bytes[i+1] == 0x81 and bytes[i+2] == 0xEC then
+                        stackFrameSize = bytes[i+3] + bytes[i+4] * 256
+                        break
+                    end
+                end
+            else
+                -- x86: detect from stack operations
+                if prologueType == "push ebp; mov ebp, esp" then
+                    callingConvention = "stdcall"
+                elseif prologueType == "pushad; popad" then
+                    callingConvention = "fastcall"
+                end
+            end
+        end
+    end
+
+    -- Count instructions in function
+    local instCount = 0
+    if funcStart and funcEnd then
+        local current = funcStart
+        while current <= funcEnd and instCount < 10000 do
+            local sz = getInstructionSize(current)
+            if not sz or sz == 0 then break end
+            instCount = instCount + 1
+            current = current + sz
+        end
+    end
+
+    return {
+        success = true,
+        query_address = toHex(addr),
+        function_start = funcStart and toHex(funcStart) or nil,
+        function_end = funcEnd and toHex(funcEnd) or nil,
+        function_size = (funcStart and funcEnd) and (funcEnd - funcStart + 1) or nil,
+        prologue_type = prologueType,
+        calling_convention = callingConvention,
+        param_count = paramCount,
+        stack_frame_size = stackFrameSize,
+        instruction_count = instCount,
+        arch = is64 and "x64" or "x86",
+        note = not funcStart and "No standard function prologue found within search range" or nil
+    }
+end
+
+function cmd_xref_summary(params)
+    local addr = params.address
+    local maxRefs = params.max_refs or 100
+
+    if type(addr) == "string" then addr = getAddressSafe(addr) end
+    if not addr then return { success = false, error = "Invalid address" } end
+
+    -- Find code references (who accesses this address)
+    local codeRefs = {}
+    local ok1, refs1 = pcall(findReferences, addr)
+    if ok1 and refs1 then
+        for i = 1, math.min(#refs1, maxRefs) do
+            table.insert(codeRefs, refs1[i])
+        end
+    end
+
+    -- Find call references (who calls this function)
+    local callRefs = {}
+    local ok2, refs2 = pcall(findCallReferences, addr)
+    if ok2 and refs2 then
+        for i = 1, math.min(#refs2, maxRefs) do
+            table.insert(callRefs, refs2[i])
+        end
+    end
+
+    return {
+        success = true,
+        target_address = toHex(addr),
+        code_references_count = #codeRefs,
+        call_references_count = #callRefs,
+        total_references = #codeRefs + #callRefs,
+        code_references = codeRefs,
+        call_references = callRefs
+    }
+end
+
+function cmd_pointer_scan(params)
+    local value = params.value
+    local valueType = params.value_type or "dword"
+    local maxResults = params.max_results or 100
+
+    if value == nil then return { success = false, error = "Missing value" } end
+
+    -- Map value type to CE variable type
+    local varType = vtDword
+    if valueType == "byte" then varType = vtByte
+    elseif valueType == "word" then varType = vtWord
+    elseif valueType == "qword" then varType = vtQword
+    elseif valueType == "float" then varType = vtSingle
+    elseif valueType == "double" then varType = vtDouble end
+
+    -- Create memory scanner using correct CE API
+    local ms = createMemScan()
+    ms.firstScan(soExactValue, varType, rtRounded, tostring(value), nil, 0, 0x7FFFFFFFFFFFFFFF, "+W-C", fsmNotAligned, "1", false, false, false, false)
+    ms.waitTillDone()
+
+    local fl = createFoundList(ms)
+    fl.initialize()
+    local total = fl.getCount()
+
+    -- Collect results
+    local addresses = {}
+    local endIdx = math.min(maxResults, total) - 1
+    for i = 0, endIdx do
+        local addrStr = fl.getAddress(i)
+        if addrStr then
+            if not addrStr:match("^0x") and not addrStr:match("^0X") then
+                addrStr = "0x" .. addrStr
+            end
+            table.insert(addresses, addrStr)
+        end
+    end
+
+    -- Cleanup
+    pcall(function() fl.destroy() end)
+    pcall(function() ms.destroy() end)
+
+    return {
+        success = true,
+        value = tostring(value),
+        value_type = valueType,
+        found_count = #addresses,
+        addresses = addresses
+    }
+end
+
+function cmd_managed_string_refs(params)
+    local text = params.text
+    local maxStrings = math.min(params.max_strings or 5, 10)
+    local maxRefsPerString = math.min(params.max_refs_per_string or 20, 100)
+    local maxRawStringHits = math.min(params.max_raw_string_hits or 1000, 10000)
+    local startAddress = params.start_address or 0x20000000000
+    local stopAddress = params.stop_address or 0x3FFFFFFFFFF
+    local ownerOffsets = params.owner_offsets or {0x38, 0x40, 0x60, 0x70, 0xB8, 0xC8}
+
+    if not text or text == "" then
+        return { success = false, error = "Missing text" }
+    end
+
+    if type(startAddress) == "string" then
+        local parsed, err = parseAddress(startAddress)
+        if not parsed then return { success = false, error = err } end
+        startAddress = parsed
+    end
+
+    if type(stopAddress) == "string" then
+        local parsed, err = parseAddress(stopAddress)
+        if not parsed then return { success = false, error = err } end
+        stopAddress = parsed
+    end
+
+    local function readManagedStringObject(addr)
+        if not addr or addr == 0 then return nil end
+        local okLen, len = pcall(readInteger, addr + 0x10)
+        if not okLen or not len or len <= 0 or len > 256 then return nil end
+
+        local chars = {}
+        for i = 0, len - 1 do
+            local okChar, ch = pcall(readSmallInteger, addr + 0x14 + (i * 2))
+            if not okChar or not ch or ch == 0 then break end
+            if ch < 32 or ch > 126 then return nil end
+            chars[#chars + 1] = string.char(ch)
+        end
+
+        local value = table.concat(chars)
+        if value == "" then return nil end
+        return value
+    end
+
+    local pattern = {}
+    for i = 1, #text do
+        pattern[#pattern + 1] = string.format("%02X 00", string.byte(text, i))
+    end
+
+    local ms = createMemScan()
+    ms.firstScan(
+        soExactValue,
+        vtByteArray,
+        rtRounded,
+        table.concat(pattern, " "),
+        nil,
+        startAddress,
+        stopAddress,
+        "+W-C",
+        fsmNotAligned,
+        "1",
+        true,
+        false,
+        false,
+        false
+    )
+    ms.waitTillDone()
+
+    local fl = createFoundList(ms)
+    fl.initialize()
+    local totalStringHits = fl.getCount()
+    local strings = {}
+    local seenStrings = {}
+
+    local stringLimit = math.min(totalStringHits, maxRawStringHits) - 1
+    for i = 0, stringLimit do
+        local addrStr = fl.getAddress(i)
+        if addrStr then
+            local charsAddr = getAddress(addrStr)
+            local stringObj = charsAddr - 0x14
+            local value = readManagedStringObject(stringObj)
+            if value and not seenStrings[stringObj] then
+                seenStrings[stringObj] = true
+                strings[#strings + 1] = {
+                    string_object = toHex(stringObj),
+                    chars_address = toHex(charsAddr),
+                    value = value
+                }
+            end
+        end
+
+        if #strings >= maxStrings then
+            break
+        end
+    end
+
+    pcall(function() fl.destroy() end)
+    pcall(function() ms.destroy() end)
+
+    for _, item in ipairs(strings) do
+        local stringObj = getAddress(item.string_object)
+        local refScan = createMemScan()
+        refScan.firstScan(
+            soExactValue,
+            vtQword,
+            rtRounded,
+            tostring(stringObj),
+            nil,
+            startAddress,
+            stopAddress,
+            "+W-C",
+            fsmNotAligned,
+            "1",
+            false,
+            false,
+            false,
+            false
+        )
+        refScan.waitTillDone()
+
+        local refList = createFoundList(refScan)
+        refList.initialize()
+        local totalRefs = refList.getCount()
+        local refs = {}
+        local endIdx = math.min(totalRefs, maxRefsPerString) - 1
+        for i = 0, endIdx do
+            local refStr = refList.getAddress(i)
+            if refStr then
+                local refAddr = getAddress(refStr)
+                local owners = {}
+                for _, off in ipairs(ownerOffsets) do
+                    owners[#owners + 1] = {
+                        offset = string.format("0x%X", off),
+                        owner = toHex(refAddr - off)
+                    }
+                end
+                refs[#refs + 1] = {
+                    ref_address = toHex(refAddr),
+                    owner_candidates = owners
+                }
+            end
+        end
+
+        pcall(function() refList.destroy() end)
+        pcall(function() refScan.destroy() end)
+
+        item.ref_count = totalRefs
+        item.refs = refs
+    end
+
+    return {
+        success = true,
+        text = text,
+        string_hit_count = totalStringHits,
+        returned_strings = #strings,
+        strings = strings
+    }
+end
+
+-- >>> END UNIT-16 <<<
+
 function cmd_write_region_to_file(params)
     local pid = getOpenedProcessID()
     if not pid or pid == 0 then return { success = false, error = "No process attached" } end
@@ -5336,10 +6751,11 @@ end
 -- COMMAND DISPATCHER
 -- ============================================================================
 
-local commandHandlers = {
+commandHandlers = {
     -- Process & Modules
     get_process_info = cmd_get_process_info,
     enum_modules = cmd_enum_modules,
+    get_module_snapshot = cmd_get_module_snapshot,
     get_symbol_address = cmd_get_symbol_address,
 
     -- >>> BEGIN UNIT-07 Process Lifecycle <<<
@@ -5355,6 +6771,8 @@ local commandHandlers = {
     -- Memory Read
     read_memory = cmd_read_memory,
     read_bytes = cmd_read_memory,  -- Alias
+    multi_read = cmd_multi_read,
+    restore_bytes = cmd_restore_bytes,
     read_integer = cmd_read_integer,
     read_string = cmd_read_string,
     read_pointer = cmd_read_pointer,
@@ -5372,9 +6790,11 @@ local commandHandlers = {
     
     -- Disassembly & Analysis
     disassemble = cmd_disassemble,
+    disassemble_range = cmd_disassemble_range,
     get_instruction_info = cmd_get_instruction_info,
     find_function_boundaries = cmd_find_function_boundaries,
     analyze_function = cmd_analyze_function,
+    scan_analyze_hook = cmd_scan_analyze_hook,
     
     -- Reference Finding
     find_references = cmd_find_references,
@@ -5508,6 +6928,34 @@ local commandHandlers = {
     -- Memory Operations (Unit 14)
     copy_memory = cmd_copy_memory,
     compare_memory = cmd_compare_memory,
+    -- >>> BEGIN UNIT-15 dispatcher entries <<<
+    memory_snapshot         = cmd_memory_snapshot,
+    memory_diff             = cmd_memory_diff,
+    memory_snapshot_list    = cmd_memory_snapshot_list,
+    memory_snapshot_delete  = cmd_memory_snapshot_delete,
+    -- >>> END UNIT-15 <<<
+    -- >>> BEGIN UNIT-27 Agent Workflow dispatcher entries <<<
+    workflow_value_hunt_start     = cmd_workflow_value_hunt_start,
+    workflow_value_hunt_refine    = cmd_workflow_value_hunt_refine,
+    workflow_value_hunt_results   = cmd_workflow_value_hunt_results,
+    workflow_value_hunt_destroy   = cmd_workflow_value_hunt_destroy,
+    workflow_write_watch_start    = cmd_workflow_write_watch_start,
+    workflow_write_watch_poll     = cmd_workflow_write_watch_poll,
+    workflow_write_watch_stop     = cmd_workflow_write_watch_stop,
+    workflow_pointer_chain_find   = cmd_workflow_pointer_chain_find,
+    workflow_patch_define         = cmd_workflow_patch_define,
+    workflow_patch_status         = cmd_workflow_patch_status,
+    workflow_patch_apply          = cmd_workflow_patch_apply,
+    workflow_patch_restore        = cmd_workflow_patch_restore,
+    workflow_read_typed_batch     = cmd_workflow_read_typed_batch,
+    workflow_write_typed_batch    = cmd_workflow_write_typed_batch,
+    -- >>> END UNIT-27 <<<
+    -- >>> BEGIN UNIT-16 dispatcher entries <<<
+    function_info           = cmd_function_info,
+    xref_summary            = cmd_xref_summary,
+    pointer_scan            = cmd_pointer_scan,
+    managed_string_refs     = cmd_managed_string_refs,
+    -- >>> END UNIT-16 <<<
     write_region_to_file = cmd_write_region_to_file,
     read_region_from_file = cmd_read_region_from_file,
     md5_memory = cmd_md5_memory,
@@ -5729,18 +7177,21 @@ function StopMCPBridge()
     log("Server Stopped")
 end
 
+-- Export for reload support: allows stopping the old bridge before dofile reload
+_G._StopMCPBridge = StopMCPBridge
+
 function StartMCPBridge()
     StopMCPBridge()  -- This now also calls cleanupZombieState()
-    
+
     -- Update Global State
     log("Starting MCP Bridge v" .. VERSION)
-    
+
     serverState.running = true
     serverState.connected = false
-    
+
     -- Create the Worker Thread
     serverState.workerThread = createThread(PipeWorker)
-    
+
     log("===========================================")
     log("MCP Server Listening on: " .. PIPE_NAME)
     log("Architecture: Threaded I/O + Synchronized Execution")
@@ -5750,3 +7201,8 @@ end
 
 -- Auto-start
 StartMCPBridge()
+
+
+
+
+

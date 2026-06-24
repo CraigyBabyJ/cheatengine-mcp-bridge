@@ -4,7 +4,7 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 
 ## What this project is
 
-A three-tier bridge that lets AI agents (via MCP) drive Cheat Engine to inspect and manipulate a running Windows process. See `README.md` for user-facing docs. Current wire/app version: `12.0.0`. After the v12 overhaul the bridge exposes **~180 MCP tools** covering memory, process lifecycle, code injection, symbol management, assembly/compilation, GUI automation, input, cheat tables, and kernel-mode operations.
+A three-tier bridge that lets AI agents (via MCP) drive Cheat Engine to inspect and manipulate a running Windows process. See `README.md` for user-facing docs. Current wire/app version: `12.0.0`. After the v12 overhaul the bridge exposes **~206 MCP tools** covering memory, process lifecycle, code injection, symbol management, assembly/compilation, GUI automation, input, cheat tables, kernel-mode operations, memory snapshots, function analysis, cross-reference tools, and agent workflow helpers for value hunts, write watches, pointer-chain recovery, patch sets, and typed batch IO.
 
 ## Commands
 
@@ -100,3 +100,15 @@ List-returning commands (scan results, memory regions, modules, threads, disasse
 - `CE_LUA_Documentation.md` — Cheat Engine 7.6 Lua API reference (~229 KB). Offline source of truth when a CE function's behavior is unclear.
 - `BATCH_WORKER_BRIEFING.md` — task specifications used during the v12 parallel overhaul. Useful historical context for understanding why sections are structured as they are.
 - `plugins/` — Cheat Engine native plugin SDK headers (`cepluginsdk.h/.pas`) and Lua 5.3 headers. **Not used** by the bridge at runtime; it's reference material for CE's C plugin API and unrelated to the Lua script used here.
+
+## Unit-27 Agent Workflow Tools
+
+The bridge includes workflow-level tools intended for AI-driven trainer and memory-research sessions:
+
+- `workflow_value_hunt_start/refine/results/destroy` keeps named CE scan sessions alive across multiple game actions.
+- `workflow_write_watch_start/poll/stop` wraps hardware data breakpoints for up to four watched addresses and returns grouped writer summaries.
+- `workflow_pointer_chain_find` searches pointer roots by scanning for pointer values plus candidate offsets, ranking symbol/module roots first.
+- `workflow_patch_define/status/apply/restore` manages named patch sets with original-byte verification and restore support.
+- `workflow_read_typed_batch` and `workflow_write_typed_batch` handle compact typed bulk IO with optional verification.
+
+Also keep `agent.md` updated; it is the operational guide for future AI sessions using this MCP.

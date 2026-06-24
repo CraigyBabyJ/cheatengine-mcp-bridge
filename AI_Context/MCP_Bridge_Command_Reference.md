@@ -4,7 +4,7 @@
 >
 > **Architecture Support**: All commands automatically adapt to 32-bit or 64-bit targets. Pointer operations use `readPointer()` for automatic size handling.
 >
-> **Version**: This reference covers the full v12 tool surface (~180 tools) after all 26 implementation units land.
+> **Version**: This reference covers the full v12 tool surface (~206 tools) after all 26 implementation units land.
 
 ---
 
@@ -41,6 +41,7 @@
 29. [Pagination Convention](#29-pagination-convention)
 30. [Environment Variables](#30-environment-variables)
 31. [Error Codes & Handling](#31-error-codes--handling)
+32. [Agent Workflow Tools (Unit 27)](#32-agent-workflow-tools-unit-27)
 
 ---
 
@@ -127,6 +128,39 @@
 **Example response:**
 ```json
 {"success": true, "total": 15, "offset": 0, "limit": 50, "returned": 15, "fallback_used": false, "modules": [{"name": "kernel32.dll", "address": "0x76000000", "size": 1234567, "is_64bit": true, "path": "C:\\Windows\\System32\\kernel32.dll"}]}
+```
+
+---
+
+### `get_module_snapshot`
+
+**Purpose:** Get detailed info about a single module (by name) or all modules if no name provided.
+
+**Parameters:**
+- `module` (str, optional): Module name to look up (partial match OK). Omit to get all modules.
+
+**Returns:** JSON with (single module):
+- `success` (bool)
+- `name` (str): Module name.
+- `address` (str): Base address (hex string).
+- `size` (int): Module size in bytes.
+- `is_64bit` (bool): Whether the module is 64-bit.
+- `path` (str): Full file path.
+- `entry_point` (str): Entry point address (hex string).
+
+When no `module` is provided, returns:
+- `success` (bool)
+- `module_count` (int): Number of modules.
+- `modules` (array): List of module objects as above.
+
+**Example request:**
+```json
+{"method": "get_module_snapshot", "params": {"module": "kernel32"}}
+```
+
+**Example response:**
+```json
+{"success": true, "name": "kernel32.dll", "address": "0x76000000", "size": 1234567, "is_64bit": true, "path": "C:\\Windows\\System32\\kernel32.dll", "entry_point": "0x76001000"}
 ```
 
 ---
@@ -374,6 +408,67 @@
 
 ---
 
+### `multi_read`
+
+**Purpose:** Read multiple memory locations in a single call, reducing round-trip overhead.
+
+**Parameters:**
+- `reads` (array, required): List of read specs. Each spec is an object with:
+  - `address` (str, required): Memory address to read.
+  - `type` (str, optional): One of `"byte"`, `"word"`, `"dword"`, `"qword"`, `"float"`, `"double"`, `"string"`. If omitted, reads raw bytes.
+  - `size` (int, optional): Number of bytes to read (used when no `type` is specified). Default 16.
+
+**Returns:** JSON with:
+- `success` (bool)
+- `results` (array): List of result objects. Each contains:
+  - `address` (str): The address read.
+  - `success` (bool): Whether this particular read succeeded.
+  - `value` (str|int|float): The read value (depends on type).
+  - `data` (str): Hex byte string (only for raw byte reads).
+  - `error` (str, optional): Error message if this read failed.
+
+**Example request:**
+```json
+{"method": "multi_read", "params": {"reads": [{"address": "0x00400000", "type": "dword"}, {"address": "0x00400010", "size": 8}]}}
+```
+
+**Example response:**
+```json
+{"success": true, "results": [{"address": "0x00400000", "success": true, "value": 42}, {"address": "0x00400010", "success": true, "data": "4D 5A 90 00 03 00 00 00"}]}
+```
+
+---
+
+### `restore_bytes`
+
+**Purpose:** Save original bytes at an address, optionally patch them, then restore and verify.
+
+**Parameters:**
+- `address` (str, required): Memory address.
+- `size` (int, required): Number of bytes to save/restore.
+- `new_bytes` (array, optional): Byte values to patch before restoring. If omitted, just saves and restores immediately.
+
+**Returns:** JSON with:
+- `success` (bool)
+- `address` (str)
+- `size` (int)
+- `original_hex` (str): Space-separated hex of the saved original bytes.
+- `was_patched` (bool): Whether bytes were patched before restore.
+- `restored` (bool): Whether restoration was verified successful.
+- `note` (str): Status message.
+
+**Example request:**
+```json
+{"method": "restore_bytes", "params": {"address": "0x00401000", "size": 5, "new_bytes": [0x90, 0x90, 0x90, 0x90, 0x90]}}
+```
+
+**Example response:**
+```json
+{"success": true, "address": "0x00401000", "size": 5, "original_hex": "55 8B EC 83 EC 10", "was_patched": true, "restored": true, "note": "Bytes successfully restored and verified"}
+```
+
+---
+
 ### `checksum_memory`
 
 **Purpose:** Calculate MD5 hash of a memory region to detect modifications.
@@ -396,6 +491,107 @@
 **Example response:**
 ```json
 {"success": true, "address": "0x00400000", "size": 256, "md5_hash": "d41d8cd98f00b204e9800998ecf8427e"}
+```
+
+---
+
+### `memory_snapshot`
+
+**Purpose:** Take a named snapshot of a memory region for later comparison.
+
+**Parameters:**
+- `name` (str, required): Unique snapshot name.
+- `address` (str, required): Base address.
+- `size` (int, default=256): Bytes to snapshot.
+
+**Returns:** JSON with:
+- `success` (bool)
+- `name` (str)
+- `address` (str)
+- `size` (int)
+
+**Example request:**
+```json
+{"method": "memory_snapshot", "params": {"name": "pre_spawn", "address": "0x00401000", "size": 768}}
+```
+
+**Example response:**
+```json
+{"success": true, "name": "pre_spawn", "address": "0x00401000", "size": 768}
+```
+
+---
+
+### `memory_diff`
+
+**Purpose:** Compare current memory against a stored snapshot. Returns diff details including first difference, total diff count, and up to 20 individual byte differences.
+
+**Parameters:**
+- `name` (str, required): Snapshot name.
+
+**Returns:** JSON with:
+- `success` (bool)
+- `name` (str)
+- `address` (str)
+- `size` (int)
+- `equal` (bool): Whether the regions are identical.
+- `first_diff` (str): Offset of first difference (hex, or `"0x0"` if equal).
+- `diff_count` (int): Number of differing bytes.
+- `diffs` (array): Up to 20 entries of `{offset, old_value, new_value}`.
+
+**Example request:**
+```json
+{"method": "memory_diff", "params": {"name": "pre_spawn"}}
+```
+
+**Example response:**
+```json
+{"success": true, "name": "pre_spawn", "address": "0x00401000", "size": 768, "equal": false, "first_diff": "0x28", "diff_count": 3, "diffs": [{"offset": "0x28", "old_value": 100, "new_value": 99}, {"offset": "0x30", "old_value": 0, "new_value": 1}]}
+```
+
+---
+
+### `memory_snapshot_list`
+
+**Purpose:** List all stored memory snapshots.
+
+**Parameters:** None.
+
+**Returns:** JSON with:
+- `success` (bool)
+- `snapshots` (array): List of `{name, address, size}`.
+
+**Example request:**
+```json
+{"method": "memory_snapshot_list", "params": {}}
+```
+
+**Example response:**
+```json
+{"success": true, "snapshots": [{"name": "pre_spawn", "address": "0x00401000", "size": 768}]}
+```
+
+---
+
+### `memory_snapshot_delete`
+
+**Purpose:** Delete a stored memory snapshot.
+
+**Parameters:**
+- `name` (str, required): Snapshot name.
+
+**Returns:** JSON with:
+- `success` (bool)
+- `name` (str)
+
+**Example request:**
+```json
+{"method": "memory_snapshot_delete", "params": {"name": "pre_spawn"}}
+```
+
+**Example response:**
+```json
+{"success": true, "name": "pre_spawn"}
 ```
 
 ---
@@ -683,6 +879,41 @@
 
 ---
 
+### `disassemble_range`
+
+**Purpose:** Disassemble all instructions between a start and end address.
+
+**Parameters:**
+- `start` (str, required): Start address (hex string or symbol).
+- `end` (str, required): End address (must be after start).
+- `offset` (int, default=0): Pagination offset.
+- `limit` (int, default=100): Maximum instructions to return.
+
+**Returns:** JSON with:
+- `success` (bool)
+- `start_address` (str): Start address (hex).
+- `end_address` (str): End address (hex).
+- `range_bytes` (int): Size of the range in bytes.
+- `total` (int): Total instructions disassembled.
+- `offset` (int)
+- `limit` (int)
+- `returned` (int)
+- `instructions` (array): List of `{address, offset, size, bytes, instruction}`.
+
+**Example request:**
+```json
+{"method": "disassemble_range", "params": {"start": "0x00401000", "end": "0x00401080"}}
+```
+
+**Example response:**
+```json
+{"success": true, "start_address": "0x00401000", "end_address": "0x00401080", "range_bytes": 128, "total": 30, "offset": 0, "limit": 100, "returned": 30, "instructions": [{"address": "0x00401000", "offset": 0, "size": 1, "bytes": "55", "instruction": "push ebp"}]}
+```
+
+**Note**: Maximum range is 64 KB (65536 bytes) to prevent excessive disassembly.
+
+---
+
 ### `get_instruction_info`
 
 **Purpose:** Get detailed information about a single instruction at an address.
@@ -775,6 +1006,54 @@
 
 ---
 
+### `scan_analyze_hook`
+
+**Purpose:** Killer workflow tool — scan for a byte pattern, then analyze each match for hook candidates. Combines AOB scanning with function boundary detection and code analysis.
+
+**Parameters:**
+- `pattern` (str, required): AOB byte pattern (e.g. `"48 89 5C 24 08"`)
+- `max_matches` (int, default=10, hard cap=50): Maximum AOB matches to analyze
+- `range` (int, default=64, hard cap=256): Bytes to scan around each match
+- `protection` (str, default="+X"): Memory protection filter
+
+**Limitations:**
+- Function-boundary detection only searches backward 4KB for prologue patterns (55 8B EC, 55 48 89 E5, 48 83 EC xx) and forward 4KB for C3/C2 returns. Non-standard prologues, tail calls, and multiple exit points may not be detected.
+- AOB scan is synchronous and may block for broad patterns. The `CE_MCP_TIMEOUT` env var can limit total execution time.
+- The `total_matches` field reports the full AOB scan count; `analyzed` is how many were actually processed (capped by `max_matches`).
+
+**Returns:** JSON with:
+- `success` (bool)
+- `pattern` (str)
+- `total_matches` (int)
+- `analyzed` (int)
+- `matches` (array): Each entry has:
+  - `match_address` (str)
+  - `function_start` (str or null)
+  - `function_end` (str or null)
+  - `prologue_type` (str or null)
+  - `hook_candidates` (array): Each has `address`, `type`, `instruction`, `bytes`, `size`, `reason`
+  - `candidate_count` (int)
+
+**Hook candidate types:**
+- `jmp`: Unconditional jump (E9, EB, FF/4, FF/5) — can redirect
+- `jcc`: Conditional jump (7x, 0F 8x) — can force or redirect
+- `call`: Function call (E8, FF/2) — can intercept or replace
+- `prologue`: Function prologue (55 48 89 E5, 55 8B EC) — ideal hook entry
+- `nop_sled`: NOP padding (90 90...) — suitable for hook injection
+- `ret`: Function return (C3, C2) — can hook for epilogue analysis
+
+**Example request:**
+```json
+{"method": "scan_analyze_hook", "params": {"pattern": "48 89 5C 24 08", "max_matches": 5, "range": 128}}
+```
+
+**Example response:** *(untested — illustrates expected shape)*
+```json
+{"success": true, "pattern": "48 89 5C 24 08", "total_matches": 15, "analyzed": 5, "matches": [{"match_address": "0x140001000", "function_start": "0x140000F80", "function_end": "0x140001050", "prologue_type": "x64_standard", "hook_candidates": [{"address": "0x140000F80", "type": "prologue", "instruction": "push rbp", "bytes": "55", "size": 1, "reason": "Function prologue - ideal hook entry point"}, {"address": "0x140000F90", "type": "call", "instruction": "call 0x140003000", "bytes": "E8 73 1F 00 00", "size": 5, "reason": "Function call - can intercept or replace"}], "candidate_count": 2}]}
+```
+
+---
+
 ### `find_references`
 
 **Purpose:** Find all code locations that reference (access) a specific address.
@@ -830,6 +1109,67 @@
 **Example response:**
 ```json
 {"success": true, "function_address": "0x00401000", "total": 10, "offset": 0, "limit": 50, "returned": 10, "callers": [{"caller_address": "0x00402050", "instruction": "call 0x00401000"}]}
+```
+
+---
+
+### `function_info`
+
+**Purpose:** Analyze a function at the given address. Returns boundaries, prologue type, calling convention, parameter count, stack frame size, and instruction count.
+
+**Parameters:**
+- `address` (str, required): Address inside the function.
+- `max_search` (int, default=4096): Maximum bytes to search for prologue/epilogue.
+
+**Returns:** JSON with:
+- `success` (bool)
+- `function_start` (str): Start address (hex).
+- `function_end` (str): End address (hex).
+- `function_size` (int): Size in bytes.
+- `prologue_type` (str): One of `"x86_standard"`, `"x64_standard"`, `"x64_leaf"`, `"unknown"`.
+- `calling_convention` (str): Detected convention (e.g., `"cdecl"`, `"stdcall"`, `"fastcall"`, `"thiscall"`).
+- `param_count` (int): Number of parameters.
+- `stack_frame_size` (int): Stack frame size in bytes.
+- `instruction_count` (int): Number of instructions.
+- `arch` (str): `"x86"` or `"x64"`.
+
+**Example request:**
+```json
+{"method": "function_info", "params": {"address": "0x00401000"}}
+```
+
+**Example response:**
+```json
+{"success": true, "function_start": "0x00401000", "function_end": "0x004010F8", "function_size": 248, "prologue_type": "x64_standard", "calling_convention": "fastcall", "param_count": 2, "stack_frame_size": 32, "instruction_count": 45, "arch": "x64"}
+```
+
+---
+
+### `xref_summary`
+
+**Purpose:** Combined cross-reference analysis for a memory address. Returns both code references (who accesses this address) and call references (who calls this function).
+
+**Parameters:**
+- `address` (str, required): Target address (hex string or symbol).
+- `max_refs` (int, default=100): Maximum references to return per category.
+
+**Returns:** JSON with:
+- `success` (bool)
+- `target_address` (str)
+- `code_references_count` (int): Total code references found.
+- `call_references_count` (int): Total call references found.
+- `total_references` (int): Sum of both.
+- `code_references` (array): List of `{address, instruction}`.
+- `call_references` (array): List of `{caller_address, instruction}`.
+
+**Example request:**
+```json
+{"method": "xref_summary", "params": {"address": "0x00401000", "max_refs": 50}}
+```
+
+**Example response:**
+```json
+{"success": true, "target_address": "0x00401000", "code_references_count": 5, "call_references_count": 3, "total_references": 8, "code_references": [{"address": "0x00402000", "instruction": "mov rax, [0x00401000]"}], "call_references": [{"caller_address": "0x00402050", "instruction": "call 0x00401000"}]}
 ```
 
 ---
@@ -2251,6 +2591,32 @@
 
 ---
 
+### `pointer_scan`
+
+**Purpose:** Quick scan for all memory addresses containing a specific value. Faster than full memory scan for simple value lookups.
+
+**Parameters:**
+- `value` (str, required): Value to search for.
+- `value_type` (str, default=`"dword"`): One of `"byte"`, `"word"`, `"dword"`, `"qword"`, `"float"`, `"double"`.
+- `max_results` (int, default=100): Maximum addresses to return.
+
+**Returns:** JSON with:
+- `success` (bool)
+- `found_count` (int): Number of addresses found.
+- `addresses` (array): Hex address strings.
+
+**Example request:**
+```json
+{"method": "pointer_scan", "params": {"value": "100", "value_type": "dword", "max_results": 20}}
+```
+
+**Example response:**
+```json
+{"success": true, "found_count": 5, "addresses": ["0x00401000", "0x00402050", "0x00503000"]}
+```
+
+---
+
 ## 21. Window & GUI (Unit 16)
 
 ### `find_window`
@@ -3255,6 +3621,40 @@ All commands return `success: false` with an `error` field on failure:
 4. **Hardware breakpoint slots** are a hard CPU limit (4 slots). Always call `clear_all_breakpoints` when done.
 5. **DBVM errors are non-fatal** — if DBVM is unavailable, fall back to hardware breakpoints.
 
+
+---
+
+## 32. Agent Workflow Tools (Unit 27)
+
+Workflow tools combine low-level CE operations into stateful flows for trainer creation and game-update recovery.
+
+| Tool | Purpose |
+|------|---------|
+| `workflow_value_hunt_start` | Start a named scan session from an initial exact value |
+| `workflow_value_hunt_refine` | Refine a scan with `exact`, `changed`, `unchanged`, `increased`, `decreased`, `bigger`, or `smaller` |
+| `workflow_value_hunt_results` | Page through current candidates |
+| `workflow_value_hunt_destroy` | Destroy the named scan and free CE scan objects |
+| `workflow_write_watch_start` | Watch up to four addresses with hardware data breakpoints |
+| `workflow_write_watch_poll` | Return captured hits and grouped writer summaries |
+| `workflow_write_watch_stop` | Stop a watch and remove its breakpoints |
+| `workflow_pointer_chain_find` | Search pointer roots where `pointer_value + offset == next_node` |
+| `workflow_patch_define` | Store a named patch set with patched bytes and optional original bytes |
+| `workflow_patch_status` | Read current bytes and report `original`, `patched`, or `unknown` |
+| `workflow_patch_apply` | Apply a patch set, verifying original bytes unless `force=true` |
+| `workflow_patch_restore` | Restore original bytes for a patch set |
+| `workflow_read_typed_batch` | Read many typed values in one call |
+| `workflow_write_typed_batch` | Write many typed values with optional verification |
+
+Recommended flow:
+
+```
+workflow_value_hunt_start -> in-game change -> workflow_value_hunt_refine
+workflow_value_hunt_results -> workflow_write_watch_start -> in-game trigger
+workflow_write_watch_poll -> workflow_pointer_chain_find -> workflow_patch_define/status/apply
+```
+
+Use `agent.md` for the operational AI playbook and examples.
+
 ---
 
 ## Workflow Examples
@@ -3323,3 +3723,4 @@ All commands return `success: false` with an `error` field on failure:
 10. **Use `dissect_structure`** on unknown pointers to immediately understand their layout.
 11. **Use `get_rtti_classname`** to identify C++ object types instantly.
 12. **Enable BSOD prevention**: In CE Settings → Extra, disable "Query memory region routines".
+

@@ -194,19 +194,25 @@ Use the `ping` tool to verify connectivity:
 
 ---
 
-## ~180 MCP Tools Available
+## ~206 MCP Tools Available
 
 ### Memory
 | Tool | Description |
 |------|-------------|
 | `read_memory`, `read_integer`, `read_string` | Read any data type |
 | `read_pointer_chain` | Follow `[[base+0x10]+0x20]` paths |
-| `scan_all`, `aob_scan` | Find values and byte patterns |
+| `multi_read` | Batch read multiple addresses in one call |
+| `restore_bytes` | Save, optionally patch, then restore bytes |
+| `memory_snapshot`, `memory_diff`, `memory_snapshot_list`, `memory_snapshot_delete` | Save and compare memory regions over time |
+| `scan_all`, `aob_scan`, `pointer_scan` | Find values, byte patterns, and quick value lookups |
 
 ### Analysis
 | Tool | Description |
 |------|-------------|
-| `disassemble`, `analyze_function` | Code analysis |
+| `disassemble`, `disassemble_range`, `analyze_function` | Code analysis |
+| `function_info` | Detect prologue, calling convention, param count, stack frame |
+| `xref_summary` | Combined code + call cross-references in one call |
+| `scan_analyze_hook` | AOB scan with automatic hook-point detection |
 | `dissect_structure` | Auto-detect fields and types |
 | `get_rtti_classname` | Identify C++ object types |
 | `find_references`, `find_call_references` | Cross-references |
@@ -216,6 +222,16 @@ Use the `ping` tool to verify connectivity:
 |------|-------------|
 | `set_breakpoint`, `set_data_breakpoint` | Hardware breakpoints |
 | `start_dbvm_watch` | Ring -1 invisible tracing |
+
+
+### Agent Workflows
+| Tool | Description |
+|------|-------------|
+| `workflow_value_hunt_*` | Named multi-step scan sessions for exact/changed/increased/decreased value hunting |
+| `workflow_write_watch_*` | Watch up to four addresses and summarize which instructions write/access them |
+| `workflow_pointer_chain_find` | Recover likely pointer chains to a dynamic address and rank stable roots |
+| `workflow_patch_*` | Define, verify, apply, and restore named patch sets |
+| `workflow_read_typed_batch`, `workflow_write_typed_batch` | Compact typed bulk IO with optional verification |
 
 ### Process Lifecycle
 | Tool | Description |
@@ -382,3 +398,4 @@ You no longer need to be an expert. Just ask the right questions.
 ⚠️ EDUCATIONAL DISCLAIMER
 
 This code is for educational and research purposes only. It's created to show the capabilities of the Model Context Protocol (MCP) and LLM-based debugging. I do not condone the use of these tools for malicious hacking, cheating in multiplayer games, or violating Terms of Service. This is a demonstration of software engineering automation.
+

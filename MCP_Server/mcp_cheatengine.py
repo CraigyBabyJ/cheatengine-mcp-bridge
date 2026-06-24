@@ -93,6 +93,18 @@ import time
 import math
 import threading
 import traceback
+import pathlib
+import subprocess
+
+try:
+    import tomllib
+except ImportError:
+    tomllib = None
+
+try:
+    import winreg
+except ImportError:
+    winreg = None
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -454,6 +466,252 @@ ce_client = _create_bridge_client()
 
 mcp = FastMCP(MCP_SERVER_NAME)
 
+
+def _health_check_entry(checks, name, status, message, **details):
+    entry = {
+        "name": name,
+        "status": status,
+        "message": message,
+    }
+    if details:
+        entry["details"] = details
+    checks.append(entry)
+
+
+def _health_check_process_running(names):
+    if sys.platform != "win32":
+        return None
+    try:
+        completed = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception as exc:
+        return {"error": str(exc)}
+    if completed.returncode != 0:
+        return {"error": completed.stderr.strip() or completed.stdout.strip()}
+    running = []
+    lower_names = {name.lower() for name in names}
+    for line in completed.stdout.splitlines():
+        image = line.split(",", 1)[0].strip().strip('"').lower()
+        if image in lower_names:
+            running.append(image)
+    return {"running": sorted(set(running))}
+
+
+def _health_check_blocklist_value():
+    if winreg is None or sys.platform != "win32":
+        return None
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\CI\Config",
+        ) as key:
+            value, value_type = winreg.QueryValueEx(key, "VulnerableDriverBlocklistEnable")
+            return {"value": int(value), "type": value_type}
+    except FileNotFoundError:
+        return {"value": None}
+    except PermissionError as exc:
+        return {"error": str(exc)}
+    except OSError as exc:
+        return {"error": str(exc)}
+
+
+def _health_check_memory_integrity_value():
+    if winreg is None or sys.platform != "win32":
+        return None
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity",
+        ) as key:
+            value, value_type = winreg.QueryValueEx(key, "Enabled")
+            return {"value": int(value), "type": value_type}
+    except FileNotFoundError:
+        return {"value": None}
+    except PermissionError as exc:
+        return {"error": str(exc)}
+    except OSError as exc:
+        return {"error": str(exc)}
+
+
+def _health_check_codex_config():
+    config_path = pathlib.Path.home() / ".codex" / "config.toml"
+    expected_command = r"R:\projects\cheatengine-mcp-bridge\.venv\Scripts\python.exe"
+    expected_arg = r"R:\projects\cheatengine-mcp-bridge\MCP_Server\mcp_cheatengine.py"
+    if not config_path.exists():
+        return {"path": str(config_path), "exists": False}
+    result = {"path": str(config_path), "exists": True}
+    if tomllib is None:
+        result["parse_error"] = "tomllib unavailable"
+        return result
+    try:
+        data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        result["parse_error"] = str(exc)
+        return result
+    server = data.get("mcp_servers", {}).get("cheatengine")
+    result["server_present"] = server is not None
+    if server is not None:
+        result["command"] = server.get("command")
+        result["args"] = server.get("args", [])
+        result["command_ok"] = server.get("command") == expected_command
+        result["args_ok"] = expected_arg in server.get("args", [])
+    project = data.get("projects", {}).get(r"R:\projects\cheatengine-mcp-bridge")
+    result["trusted_project"] = project is not None and project.get("trust_level") == "trusted"
+    return result
+
+
+def _run_local_health_check(include_bridge: bool = True):
+    checks = []
+    repo_root = pathlib.Path(__file__).resolve().parents[1]
+    venv_python = repo_root / ".venv" / "Scripts" / "python.exe"
+    ce_exe_paths = [
+        pathlib.Path(r"C:\Program Files\Cheat Engine\cheatengine-x86_64.exe"),
+        pathlib.Path(r"C:\Program Files\Cheat Engine\Cheat Engine.exe"),
+    ]
+    autorun_loader = pathlib.Path(r"C:\Program Files\Cheat Engine\autorun\codex_mcp_bridge.lua")
+    bridge_lua = repo_root / "MCP_Server" / "ce_mcp_bridge.lua"
+
+    _health_check_entry(
+        checks,
+        "repo",
+        "ok" if repo_root.exists() else "fail",
+        f"Repository path {'exists' if repo_root.exists() else 'is missing'}.",
+        path=str(repo_root),
+    )
+    _health_check_entry(
+        checks,
+        "python_venv",
+        "ok" if venv_python.exists() else "fail",
+        f"Project virtualenv Python {'exists' if venv_python.exists() else 'is missing'}.",
+        path=str(venv_python),
+    )
+    _health_check_entry(
+        checks,
+        "cheat_engine_install",
+        "ok" if any(path.exists() for path in ce_exe_paths) else "fail",
+        "Cheat Engine executable found." if any(path.exists() for path in ce_exe_paths) else "Cheat Engine executable was not found in the standard install path.",
+        paths=[str(path) for path in ce_exe_paths if path.exists()],
+    )
+    _health_check_entry(
+        checks,
+        "ce_bridge_lua",
+        "ok" if bridge_lua.exists() else "fail",
+        f"Bridge Lua script {'exists' if bridge_lua.exists() else 'is missing'}.",
+        path=str(bridge_lua),
+    )
+    _health_check_entry(
+        checks,
+        "ce_autorun_loader",
+        "ok" if autorun_loader.exists() else "warn",
+        f"Cheat Engine autorun loader {'exists' if autorun_loader.exists() else 'is missing'}.",
+        path=str(autorun_loader),
+    )
+
+    process_state = _health_check_process_running([
+        "cheatengine-x86_64.exe",
+        "cheatengine-x86_64-SSE4-AVX2.exe",
+        "cheatengine-i386.exe",
+        "Cheat Engine.exe",
+    ])
+    if process_state is None:
+        _health_check_entry(checks, "cheat_engine_running", "warn", "Process check is only available on Windows.")
+    elif "error" in process_state:
+        _health_check_entry(checks, "cheat_engine_running", "warn", "Could not query running processes.", error=process_state["error"])
+    elif process_state["running"]:
+        _health_check_entry(checks, "cheat_engine_running", "ok", "Cheat Engine is running.", processes=process_state["running"])
+    else:
+        _health_check_entry(checks, "cheat_engine_running", "warn", "Cheat Engine is not currently running.")
+
+    blocklist = _health_check_blocklist_value()
+    if blocklist is None:
+        _health_check_entry(checks, "windows_driver_blocklist", "warn", "Registry check is only available on Windows.")
+    elif "error" in blocklist:
+        _health_check_entry(checks, "windows_driver_blocklist", "warn", "Could not read vulnerable driver blocklist registry value.", error=blocklist["error"])
+    elif blocklist.get("value") == 0:
+        _health_check_entry(checks, "windows_driver_blocklist", "ok", "Windows vulnerable driver blocklist is disabled.", value=0)
+    elif blocklist.get("value") == 1:
+        _health_check_entry(checks, "windows_driver_blocklist", "warn", "Windows vulnerable driver blocklist is enabled; CE's kernel driver may be blocked.", value=1)
+    else:
+        _health_check_entry(checks, "windows_driver_blocklist", "warn", "Windows vulnerable driver blocklist value is not explicitly set.", value=blocklist.get("value"))
+
+    memory_integrity = _health_check_memory_integrity_value()
+    if memory_integrity is None:
+        _health_check_entry(checks, "windows_memory_integrity", "warn", "Registry check is only available on Windows.")
+    elif "error" in memory_integrity:
+        _health_check_entry(checks, "windows_memory_integrity", "warn", "Could not read Memory Integrity/HVCI registry value.", error=memory_integrity["error"])
+    elif memory_integrity.get("value") == 0:
+        _health_check_entry(checks, "windows_memory_integrity", "ok", "Windows Memory Integrity/HVCI is disabled.", value=0)
+    elif memory_integrity.get("value") == 1:
+        _health_check_entry(checks, "windows_memory_integrity", "warn", "Windows Memory Integrity/HVCI is enabled; CE's DBK driver may still be blocked.", value=1)
+    else:
+        _health_check_entry(checks, "windows_memory_integrity", "warn", "Windows Memory Integrity/HVCI value is not explicitly set.", value=memory_integrity.get("value"))
+
+    codex_config = _health_check_codex_config()
+    if codex_config.get("exists") and codex_config.get("server_present") and codex_config.get("command_ok") and codex_config.get("args_ok"):
+        _health_check_entry(checks, "codex_mcp_config", "ok", "Codex MCP config contains the cheatengine server.", **codex_config)
+    elif codex_config.get("exists"):
+        _health_check_entry(checks, "codex_mcp_config", "warn", "Codex config exists, but the cheatengine MCP server is missing or differs from this setup.", **codex_config)
+    else:
+        _health_check_entry(checks, "codex_mcp_config", "warn", "Codex config was not found.", **codex_config)
+
+    bridge_details = {
+        "transport": CE_MCP_TRANSPORT,
+        "pipe": PIPE_NAME if CE_MCP_TRANSPORT == "pipe" else None,
+        "host": CE_MCP_HOST if CE_MCP_TRANSPORT == "tcp" else None,
+        "port": CE_MCP_PORT if CE_MCP_TRANSPORT == "tcp" else None,
+    }
+    if include_bridge:
+        try:
+            ping = ce_client.send_command("ping")
+            if ping.get("success") is True:
+                _health_check_entry(checks, "bridge_ping", "ok", "Cheat Engine bridge responded to ping.", **bridge_details, response=ping)
+            else:
+                _health_check_entry(checks, "bridge_ping", "fail", "Cheat Engine bridge ping returned an error.", **bridge_details, response=ping)
+        except Exception as exc:
+            _health_check_entry(checks, "bridge_ping", "fail", "Cheat Engine bridge is not reachable.", **bridge_details, error=str(exc))
+
+        try:
+            process_info = ce_client.send_command("get_process_info")
+            if process_info.get("success") is True:
+                status = "ok" if process_info.get("process_id", 0) else "warn"
+                message = "Cheat Engine is attached to a target process." if process_info.get("process_id", 0) else "Cheat Engine bridge is up, but no target process is attached."
+                _health_check_entry(checks, "attached_process", status, message, response=process_info)
+            else:
+                _health_check_entry(checks, "attached_process", "warn", "Could not read attached process info.", response=process_info)
+        except Exception as exc:
+            _health_check_entry(checks, "attached_process", "warn", "Attached process check could not run because the bridge is not reachable.", error=str(exc))
+
+    fail_count = sum(1 for check in checks if check["status"] == "fail")
+    warn_count = sum(1 for check in checks if check["status"] == "warn")
+    overall_status = "fail" if fail_count else "warn" if warn_count else "ok"
+    return {
+        "success": fail_count == 0,
+        "overall_status": overall_status,
+        "summary": {
+            "ok": sum(1 for check in checks if check["status"] == "ok"),
+            "warn": warn_count,
+            "fail": fail_count,
+        },
+        "checks": checks,
+    }
+
+
+@mcp.tool()
+def health_check(include_bridge: bool = True) -> str:
+    """Check the local Cheat Engine MCP setup and optionally ping the live CE bridge.
+
+    Args:
+        include_bridge: When true, also pings the Cheat Engine Lua bridge and checks the attached process.
+
+    Returns:
+        JSON with overall_status, summary, and per-check details.
+    """
+    return format_result(_run_local_health_check(include_bridge=include_bridge))
+
 # --- PROCESS & MODULES ---
 
 @mcp.tool()
@@ -472,6 +730,18 @@ def enum_modules(offset: int = 0, limit: int = 100) -> str:
     Returns JSON with: success, total, offset, limit, returned, modules.
     """
     return format_result(ce_client.send_command("enum_modules", {"offset": offset, "limit": limit}))
+
+@mcp.tool()
+def get_module_snapshot(module: str = None) -> str:
+    """Get detailed info about a single module or all modules if no name provided.
+    
+    Args:
+        module: Module name to look up (partial match OK). Omit to get all modules.
+    """
+    params = {}
+    if module is not None:
+        params["module"] = module
+    return format_result(ce_client.send_command("get_module_snapshot", params))
 
 @mcp.tool()
 def get_thread_list(offset: int = 0, limit: int = 100) -> str:
@@ -511,6 +781,44 @@ def get_rtti_classname(address: str) -> str:
 def read_memory(address: str, size: int = 256) -> str:
     """Read raw bytes from memory."""
     return format_result(ce_client.send_command("read_memory", {"address": address, "size": size}))
+
+@mcp.tool()
+def read_bytes(address: str, size: int = 256) -> str:
+    """Read raw bytes from memory (alias for read_memory).
+    
+    Args:
+        address: Memory address to read from (hex string or symbol).
+        size: Number of bytes to read (default 256).
+    """
+    return format_result(ce_client.send_command("read_bytes", {"address": address, "size": size}))
+
+@mcp.tool()
+def multi_read(addresses: list, size: int = 64, types: list = None) -> str:
+    """Read multiple memory locations in a single call, reducing round-trip overhead.
+    
+    Args:
+        addresses: List of addresses (strings or {"address": str, "label": str} objects).
+        size: Default byte read size per address (default 64, max 1048576).
+        types: Optional per-address type overrides: byte, word, dword, qword, float, double.
+    """
+    params = {"addresses": addresses, "size": size}
+    if types is not None:
+        params["types"] = types
+    return format_result(ce_client.send_command("multi_read", params))
+
+@mcp.tool()
+def restore_bytes(address: str, size: int, new_bytes: list = None) -> str:
+    """Restore original bytes at an address (saves and restores via write_memory).
+    
+    Args:
+        address: Memory address to restore.
+        size: Number of bytes to save/restore.
+        new_bytes: Optional bytes to patch before restoring. If omitted, just saves and restores.
+    """
+    params = {"address": address, "size": size}
+    if new_bytes is not None:
+        params["new_bytes"] = new_bytes
+    return format_result(ce_client.send_command("restore_bytes", params))
 
 @mcp.tool()
 def read_integer(address: str, type: str = "dword") -> str:
@@ -603,6 +911,17 @@ def aob_scan(pattern: str, protection: str = "+X", limit: int = 100) -> str:
     return format_result(ce_client.send_command("aob_scan", {"pattern": pattern, "protection": protection, "limit": limit}))
 
 @mcp.tool()
+def pattern_scan(pattern: str, protection: str = "+X", limit: int = 100) -> str:
+    """Scan for a byte pattern in memory (alias for aob_scan).
+    
+    Args:
+        pattern: AOB pattern string, e.g. '48 89 5C 24' or '48 ? 5C 24'.
+        protection: Memory protection filter (default '+X' for executable).
+        limit: Maximum results to return (default 100).
+    """
+    return format_result(ce_client.send_command("pattern_scan", {"pattern": pattern, "protection": protection, "limit": limit}))
+
+@mcp.tool()
 def search_string(string: str, wide: bool = False, limit: int = 100) -> str:
     """Quickly search for a text string in memory."""
     return format_result(ce_client.send_command("search_string", {"string": string, "wide": wide, "limit": limit}))
@@ -647,6 +966,20 @@ def disassemble(address: str, count: int = 20, offset: int = 0, limit: int = 100
     return format_result(ce_client.send_command("disassemble", {"address": address, "count": count, "offset": offset, "limit": limit}))
 
 @mcp.tool()
+def disassemble_range(start: str, end: str, offset: int = 0, limit: int = 100) -> str:
+    """Disassemble all instructions between a start and end address.
+
+    Args:
+        start: Start address (hex string or symbol).
+        end: End address (hex string or symbol). Must be after start.
+        offset: Start index for pagination (default 0).
+        limit: Maximum instructions to return (default 100, max 10000).
+
+    Returns JSON with: success, start_address, end_address, range_bytes, total, offset, limit, returned, instructions.
+    """
+    return format_result(ce_client.send_command("disassemble_range", {"start": start, "end": end, "offset": offset, "limit": limit}))
+
+@mcp.tool()
 def get_instruction_info(address: str) -> str:
     """Get detailed info about a single instruction (size, bytes, opcode)."""
     return format_result(ce_client.send_command("get_instruction_info", {"address": address}))
@@ -660,6 +993,35 @@ def find_function_boundaries(address: str, max_search: int = 4096) -> str:
 def analyze_function(address: str) -> str:
     """Analyze a function to find all CALL instructions output (calls made by this function)."""
     return format_result(ce_client.send_command("analyze_function", {"address": address}))
+
+@mcp.tool()
+def scan_analyze_hook(pattern: str, max_matches: int = 10, range: int = 64, protection: str = "+X") -> str:
+    """Scan for a byte pattern, then analyze each match for hook candidates.
+
+    For every AOB match it finds the surrounding function boundaries, disassembles
+    the region, and identifies hook candidates: JMP, JCC, CALL, function prologue,
+    NOP sled, and RET instructions.
+
+    Args:
+        pattern: AOB byte pattern (e.g. "48 89 5C 24 08").
+        max_matches: Max AOB matches to analyze (default 10, hard cap 50).
+        range: Bytes to scan around each match (default 64, hard cap 256).
+        protection: Memory protection filter (default "+X" for executable).
+
+    Note: Function-boundary detection only searches backward 4KB for prologue
+    patterns and forward 4KB for C3/C2 returns. Non-standard prologues or
+    tail calls may not be detected. AOB scan is synchronous.
+
+    Returns JSON with: success, pattern, total_matches, analyzed, matches[].
+    Each match includes: match_address, function_start, function_end,
+    prologue_type, hook_candidates[], candidate_count.
+    """
+    return format_result(ce_client.send_command("scan_analyze_hook", {
+        "pattern": pattern,
+        "max_matches": max_matches,
+        "range": range,
+        "protection": protection
+    }))
 
 @mcp.tool()
 def find_references(address: str, offset: int = 0, limit: int = 50) -> str:
@@ -716,6 +1078,22 @@ def set_data_breakpoint(address: str, id: str = None, access_type: str = "w", si
     }))
 
 @mcp.tool()
+def set_write_breakpoint(address: str, id: str = None, size: int = 4) -> str:
+    """Set a hardware write breakpoint (watchpoint). Triggers when memory at the address is written.
+    
+    Args:
+        address: Memory address to monitor (hex string or symbol).
+        id: Optional custom ID for the breakpoint.
+        size: Size of the watched region in bytes (default 4).
+    """
+    return format_result(ce_client.send_command("set_write_breakpoint", {
+        "address": address,
+        "id": id,
+        "access_type": "w",
+        "size": size
+    }))
+
+@mcp.tool()
 def remove_breakpoint(id: str) -> str:
     """Remove a breakpoint by its ID."""
     return format_result(ce_client.send_command("remove_breakpoint", {"id": id}))
@@ -728,6 +1106,11 @@ def list_breakpoints() -> str:
 @mcp.tool()
 def clear_all_breakpoints() -> str:
     """Remove ALL breakpoints."""
+    return format_result(ce_client.send_command("clear_all_breakpoints"))
+
+@mcp.tool()
+def clear_breakpoints() -> str:
+    """Remove ALL breakpoints (alias for clear_all_breakpoints)."""
     return format_result(ce_client.send_command("clear_all_breakpoints"))
 
 @mcp.tool()
@@ -760,6 +1143,36 @@ def start_dbvm_watch(address: str, mode: str = "w", max_entries: int = 1000) -> 
 def stop_dbvm_watch(address: str) -> str:
     """Stop DBVM watch and return results."""
     return format_result(ce_client.send_command("stop_dbvm_watch", {"address": address}))
+
+@mcp.tool()
+def find_what_writes_safe(address: str, max_entries: int = 1000) -> str:
+    """Start DBVM hypervisor watch for writes to an address (invisible to target).
+    
+    Args:
+        address: Memory address to monitor (hex string or symbol).
+        max_entries: Maximum log entries to buffer (default 1000).
+    """
+    return format_result(ce_client.send_command("find_what_writes_safe", {"address": address, "mode": "w", "max_entries": max_entries}))
+
+@mcp.tool()
+def find_what_accesses_safe(address: str, mode: str = "rw", max_entries: int = 1000) -> str:
+    """Start DBVM hypervisor watch for reads/writes to an address (invisible to target).
+    
+    Args:
+        address: Memory address to monitor (hex string or symbol).
+        mode: Watch mode - 'r' (reads), 'w' (writes), 'rw' (both, default), 'x' (execute).
+        max_entries: Maximum log entries to buffer (default 1000).
+    """
+    return format_result(ce_client.send_command("find_what_accesses_safe", {"address": address, "mode": mode, "max_entries": max_entries}))
+
+@mcp.tool()
+def get_watch_results(address: str) -> str:
+    """Stop an active DBVM watch and retrieve all logged access results.
+    
+    Args:
+        address: Memory address that was being watched (hex string or symbol).
+    """
+    return format_result(ce_client.send_command("get_watch_results", {"address": address}))
 
 @mcp.tool()
 def poll_dbvm_watch(address: str, max_results: int = 1000) -> str:
@@ -1661,6 +2074,32 @@ def compare_memory(addr1: str, addr2: str, size: int, method: int = 0) -> str:
     }))
 
 @mcp.tool()
+def memory_snapshot(name: str, address: str, size: int = 256) -> str:
+    """Take a named snapshot of a memory region. Later use memory_diff to compare current state against it."""
+    return format_result(ce_client.send_command("memory_snapshot", {
+        "name": name, "address": address, "size": size
+    }))
+
+@mcp.tool()
+def memory_diff(name: str = "default") -> str:
+    """Compare current memory at a snapshot's address against the stored snapshot. Returns diff details."""
+    return format_result(ce_client.send_command("memory_diff", {
+        "name": name
+    }))
+
+@mcp.tool()
+def memory_snapshot_list() -> str:
+    """List all stored memory snapshots."""
+    return format_result(ce_client.send_command("memory_snapshot_list", {}))
+
+@mcp.tool()
+def memory_snapshot_delete(name: str = "default") -> str:
+    """Delete a stored memory snapshot."""
+    return format_result(ce_client.send_command("memory_snapshot_delete", {
+        "name": name
+    }))
+
+@mcp.tool()
 def write_region_to_file(address: str, size: int, filename: str) -> str:
     """Write a memory region to a file. Filename must be an absolute path and must not contain '..' components."""
     return format_result(ce_client.send_command("write_region_to_file", {
@@ -1698,6 +2137,216 @@ def map_view_of_section(handle: str, address: str = None, size: int = 0) -> str:
         "handle": handle, "address": address, "size": size
     }))
 
+  # >>> BEGIN UNIT-16 Function Analysis & Xref Tools <<<
+@mcp.tool()
+def function_info(address: str, max_search: int = 4096) -> str:
+    """Analyze a function at the given address. Returns boundaries, prologue type, calling convention,
+    parameter count, stack frame size, and instruction count.
+
+    Args:
+        address: Address inside the function (hex string or symbol).
+        max_search: Maximum bytes to search for prologue/epilogue (default 4096).
+
+    Returns JSON with: success, function_start, function_end, function_size, prologue_type,
+    calling_convention, param_count, stack_frame_size, instruction_count, arch.
+    """
+    return format_result(ce_client.send_command("function_info", {
+        "address": address, "max_search": max_search
+    }))
+
+@mcp.tool()
+def xref_summary(address: str, max_refs: int = 100) -> str:
+    """Combined cross-reference analysis for a memory address. Returns both code references
+    (who accesses this address) and call references (who calls this function).
+
+    Args:
+        address: Target address (hex string or symbol).
+        max_refs: Maximum references to return per category (default 100).
+
+    Returns JSON with: success, target_address, code_references_count, call_references_count,
+    total_references, code_references, call_references.
+    """
+    return format_result(ce_client.send_command("xref_summary", {
+        "address": address, "max_refs": max_refs
+    }))
+
+@mcp.tool()
+def pointer_scan(value: str, value_type: str = "dword", max_results: int = 100) -> str:
+    """Quick scan for all memory addresses containing a specific value.
+
+    Args:
+        value: Value to search for.
+        value_type: Data type — byte, word, dword, qword, float, double (default: dword).
+        max_results: Maximum addresses to return (default 100).
+
+    Returns JSON with: success, found_count, addresses (list of hex strings).
+    """
+    return format_result(ce_client.send_command("pointer_scan", {
+        "value": value, "value_type": value_type, "max_results": max_results
+    }))
+
+@mcp.tool()
+def managed_string_refs(
+    text: str,
+    max_strings: int = 20,
+    max_refs_per_string: int = 50,
+    start_address: str = "0x20000000000",
+    stop_address: str = "0x3FFFFFFFFFF",
+) -> str:
+    """Find managed UTF-16 strings and qword references to their string objects.
+
+    Useful for reverse-engineering Unity/IL2CPP object fields: scan for a room/name
+    string, find the managed string object, then list memory fields pointing at it
+    with common owner candidates such as ref-0x60, ref-0x70, ref-0xB8.
+
+    Args:
+        text: ASCII/UTF-16 text to search for inside managed string character data.
+        max_strings: Maximum string objects to return.
+        max_refs_per_string: Maximum qword references to return for each string.
+        start_address: Start of the address range to scan.
+        stop_address: End of the address range to scan.
+
+    Returns JSON with: success, string_hit_count, strings[], refs[], owner_candidates[].
+    """
+    return format_result(ce_client.send_command("managed_string_refs", {
+        "text": text,
+        "max_strings": max_strings,
+        "max_refs_per_string": max_refs_per_string,
+        "start_address": start_address,
+        "stop_address": stop_address,
+    }))
+
+# >>> END UNIT-16 <<<
+
+# >>> BEGIN UNIT-27 Agent Workflow Tools <<<
+@mcp.tool()
+def workflow_value_hunt_start(name: str, value: str, value_type: str = "dword", protection: str = "+W-C") -> str:
+    """Start a named guided value hunt using Cheat Engine's scanner."""
+    return format_result(ce_client.send_command("workflow_value_hunt_start", {
+        "name": name, "value": value, "value_type": value_type, "protection": protection
+    }))
+
+@mcp.tool()
+def workflow_value_hunt_refine(name: str, scan_type: str = "exact", value: str = None) -> str:
+    """Refine a value hunt. scan_type: exact, changed, unchanged, increased, decreased, bigger, smaller."""
+    return format_result(ce_client.send_command("workflow_value_hunt_refine", {
+        "name": name, "scan_type": scan_type, "value": value
+    }))
+
+@mcp.tool()
+def workflow_value_hunt_results(name: str, offset: int = 0, limit: int = 100) -> str:
+    """Return paged candidates for a named value hunt."""
+    return format_result(ce_client.send_command("workflow_value_hunt_results", {
+        "name": name, "offset": offset, "limit": limit
+    }))
+
+@mcp.tool()
+def workflow_value_hunt_destroy(name: str) -> str:
+    """Destroy a named value hunt and free its scanner objects."""
+    return format_result(ce_client.send_command("workflow_value_hunt_destroy", {"name": name}))
+
+@mcp.tool()
+def workflow_write_watch_start(
+    name: str,
+    addresses: list,
+    size: int = 4,
+    access_type: str = "w",
+    max_hits: int = 50,
+    capture_stack: bool = False,
+    stack_depth: int = 16,
+    auto_remove: bool = True,
+) -> str:
+    """Start a session watch over up to four addresses using hardware data breakpoints.
+
+    Captures writer instruction, registers, value bytes, and a grouped summary. Use
+    workflow_write_watch_poll while the target is running, then workflow_write_watch_stop.
+    """
+    return format_result(ce_client.send_command("workflow_write_watch_start", {
+        "name": name,
+        "addresses": addresses,
+        "size": size,
+        "access_type": access_type,
+        "max_hits": max_hits,
+        "capture_stack": capture_stack,
+        "stack_depth": stack_depth,
+        "auto_remove": auto_remove,
+    }))
+
+@mcp.tool()
+def workflow_write_watch_poll(name: str, offset: int = 0, limit: int = 100, clear: bool = False) -> str:
+    """Poll a write-watch session and return captured hits plus grouped writer summary."""
+    return format_result(ce_client.send_command("workflow_write_watch_poll", {
+        "name": name, "offset": offset, "limit": limit, "clear": clear
+    }))
+
+@mcp.tool()
+def workflow_write_watch_stop(name: str) -> str:
+    """Stop a write-watch session and remove its hardware breakpoints."""
+    return format_result(ce_client.send_command("workflow_write_watch_stop", {"name": name}))
+
+@mcp.tool()
+def workflow_pointer_chain_find(
+    target_address: str,
+    max_depth: int = 3,
+    max_offset: int = 1024,
+    step: int = 4,
+    max_results: int = 50,
+    per_scan_limit: int = 32,
+    protection: str = "+W-C",
+) -> str:
+    """Find likely pointer chains ending at target_address by scanning pointer values near each node.
+
+    The search considers pointer_value + offset == next_node for offsets from 0..max_offset.
+    Results are ranked so module/symbol roots appear first.
+    """
+    return format_result(ce_client.send_command("workflow_pointer_chain_find", {
+        "target_address": target_address,
+        "max_depth": max_depth,
+        "max_offset": max_offset,
+        "step": step,
+        "max_results": max_results,
+        "per_scan_limit": per_scan_limit,
+        "protection": protection,
+    }))
+
+@mcp.tool()
+def workflow_patch_define(name: str, patches: list) -> str:
+    """Define a named patch set. Each patch needs address and patched_bytes; original_bytes is recommended."""
+    return format_result(ce_client.send_command("workflow_patch_define", {
+        "name": name, "patches": patches
+    }))
+
+@mcp.tool()
+def workflow_patch_status(name: str = "default") -> str:
+    """Read current bytes for every patch in a patch set and report original/patched/unknown state."""
+    return format_result(ce_client.send_command("workflow_patch_status", {"name": name}))
+
+@mcp.tool()
+def workflow_patch_apply(name: str = "default", force: bool = False) -> str:
+    """Apply a named patch set. Verifies original bytes first unless force is true."""
+    return format_result(ce_client.send_command("workflow_patch_apply", {
+        "name": name, "force": force
+    }))
+
+@mcp.tool()
+def workflow_patch_restore(name: str = "default") -> str:
+    """Restore original bytes for a named patch set."""
+    return format_result(ce_client.send_command("workflow_patch_restore", {"name": name}))
+
+@mcp.tool()
+def workflow_read_typed_batch(reads: list, value_type: str = "dword") -> str:
+    """Batch typed reads. reads may be address strings or objects with address/type."""
+    return format_result(ce_client.send_command("workflow_read_typed_batch", {
+        "reads": reads, "type": value_type
+    }))
+
+@mcp.tool()
+def workflow_write_typed_batch(writes: list, value_type: str = "dword", verify: bool = True) -> str:
+    """Batch typed writes with optional before/after verification."""
+    return format_result(ce_client.send_command("workflow_write_typed_batch", {
+        "writes": writes, "type": value_type, "verify": verify
+    }))
+# >>> END UNIT-27 <<<
 # >>> BEGIN UNIT-12 Symbol Management <<<
 @mcp.tool()
 def register_symbol(name: str, address: str, do_not_save: bool = False) -> str:
@@ -2300,3 +2949,4 @@ if __name__ == "__main__":
     except Exception as e:
         debug_log(f"Fatal Crash: {e}")
         traceback.print_exc(file=sys.stderr)
+
