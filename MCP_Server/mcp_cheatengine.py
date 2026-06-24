@@ -2346,6 +2346,73 @@ def workflow_write_typed_batch(writes: list, value_type: str = "dword", verify: 
     return format_result(ce_client.send_command("workflow_write_typed_batch", {
         "writes": writes, "type": value_type, "verify": verify
     }))
+
+@mcp.tool()
+def workflow_manifest_export(
+    name: str,
+    game: str = None,
+    process_name: str = None,
+    game_version: str = None,
+    trainer_version: str = None,
+    notes: str = None,
+    pointer_chains: list = None,
+    patches: list = None,
+    signatures: list = None,
+    writer_reports: list = None,
+    output_file: str = None,
+    include_patch_sets: bool = False,
+) -> str:
+    """Create/export a trainer manifest containing chains, patches, signatures, writer reports, and notes."""
+    return format_result(ce_client.send_command("workflow_manifest_export", {
+        "name": name,
+        "game": game,
+        "process_name": process_name,
+        "game_version": game_version,
+        "trainer_version": trainer_version,
+        "notes": notes,
+        "pointer_chains": pointer_chains or [],
+        "patches": patches or [],
+        "signatures": signatures or [],
+        "writer_reports": writer_reports or [],
+        "output_file": output_file,
+        "include_patch_sets": include_patch_sets,
+    }))
+
+@mcp.tool()
+def workflow_manifest_import(name: str = None, file: str = None, json_text: str = None, manifest: dict = None) -> str:
+    """Import a trainer manifest from a file, JSON string, or dict into the bridge session."""
+    return format_result(ce_client.send_command("workflow_manifest_import", {
+        "name": name,
+        "file": file,
+        "json": json_text,
+        "manifest": manifest,
+    }))
+
+@mcp.tool()
+def workflow_manifest_list() -> str:
+    """List trainer manifests imported into the current bridge session."""
+    return format_result(ce_client.send_command("workflow_manifest_list", {}))
+
+@mcp.tool()
+def workflow_manifest_get(name: str) -> str:
+    """Get a trainer manifest from the current bridge session."""
+    return format_result(ce_client.send_command("workflow_manifest_get", {"name": name}))
+
+@mcp.tool()
+def workflow_manifest_delete(name: str) -> str:
+    """Delete a trainer manifest from the current bridge session."""
+    return format_result(ce_client.send_command("workflow_manifest_delete", {"name": name}))
+
+@mcp.tool()
+def workflow_manifest_verify(name: str = None, file: str = None, json_text: str = None, manifest: dict = None, signature_limit: int = 10) -> str:
+    """Verify manifest process, pointer chains, patch bytes, and AOB signatures against the attached process."""
+    return format_result(ce_client.send_command("workflow_manifest_verify", {
+        "name": name,
+        "file": file,
+        "json": json_text,
+        "manifest": manifest,
+        "signature_limit": signature_limit,
+    }))
 # >>> END UNIT-27 <<<
 # >>> BEGIN UNIT-12 Symbol Management <<<
 @mcp.tool()
@@ -2949,5 +3016,6 @@ if __name__ == "__main__":
     except Exception as e:
         debug_log(f"Fatal Crash: {e}")
         traceback.print_exc(file=sys.stderr)
+
 
 

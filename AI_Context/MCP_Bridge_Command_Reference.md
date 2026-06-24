@@ -4,7 +4,7 @@
 >
 > **Architecture Support**: All commands automatically adapt to 32-bit or 64-bit targets. Pointer operations use `readPointer()` for automatic size handling.
 >
-> **Version**: This reference covers the full v12 tool surface (~207 tools) after all 26 implementation units land.
+> **Version**: This reference covers the full v12 tool surface (~213 tools) after all 26 implementation units land.
 
 ---
 
@@ -3645,13 +3645,19 @@ Workflow tools combine low-level CE operations into stateful flows for trainer c
 | `workflow_patch_restore` | Restore original bytes for a patch set |
 | `workflow_read_typed_batch` | Read many typed values in one call |
 | `workflow_write_typed_batch` | Write many typed values with optional verification |
+| `workflow_manifest_export` | Create/export a trainer manifest containing chains, patches, signatures, writer reports, and notes |
+| `workflow_manifest_import` | Import a manifest from a file, JSON string, or object |
+| `workflow_manifest_list` | List imported manifests in the current bridge session |
+| `workflow_manifest_get` | Get an imported manifest by name |
+| `workflow_manifest_delete` | Delete an imported manifest by name |
+| `workflow_manifest_verify` | Verify process, pointer chains, patch bytes, and AOB signatures against the attached process |
 
 Recommended flow:
 
 ```
 workflow_value_hunt_start -> in-game change -> workflow_value_hunt_refine
 workflow_value_hunt_results -> workflow_write_watch_start -> in-game trigger
-workflow_write_watch_poll -> workflow_writer_report -> workflow_pointer_chain_find -> workflow_patch_define/status/apply
+workflow_write_watch_poll -> workflow_writer_report -> workflow_pointer_chain_find -> workflow_patch_define/status/apply -> workflow_manifest_export/verify
 ```
 
 Use `agent.md` for the operational AI playbook and examples.
@@ -3724,5 +3730,6 @@ Use `agent.md` for the operational AI playbook and examples.
 10. **Use `dissect_structure`** on unknown pointers to immediately understand their layout.
 11. **Use `get_rtti_classname`** to identify C++ object types instantly.
 12. **Enable BSOD prevention**: In CE Settings → Extra, disable "Query memory region routines".
+
 
 

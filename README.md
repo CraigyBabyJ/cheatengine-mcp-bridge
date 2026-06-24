@@ -194,7 +194,7 @@ Use the `ping` tool to verify connectivity:
 
 ---
 
-## ~207 MCP Tools Available
+## ~213 MCP Tools Available
 
 ### Memory
 | Tool | Description |
@@ -233,6 +233,7 @@ Use the `ping` tool to verify connectivity:
 | `workflow_pointer_chain_find` | Recover likely pointer chains to a dynamic address and rank stable roots |
 | `workflow_patch_*` | Define, verify, apply, and restore named patch sets |
 | `workflow_read_typed_batch`, `workflow_write_typed_batch` | Compact typed bulk IO with optional verification |
+| `workflow_manifest_*` | Import/export/list/get/delete/verify reusable trainer manifests for any game |
 
 ### Process Lifecycle
 | Tool | Description |
@@ -399,5 +400,6 @@ You no longer need to be an expert. Just ask the right questions.
 ⚠️ EDUCATIONAL DISCLAIMER
 
 This code is for educational and research purposes only. It's created to show the capabilities of the Model Context Protocol (MCP) and LLM-based debugging. I do not condone the use of these tools for malicious hacking, cheating in multiplayer games, or violating Terms of Service. This is a demonstration of software engineering automation.
+
 
 

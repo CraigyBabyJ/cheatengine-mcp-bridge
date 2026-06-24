@@ -328,6 +328,7 @@ local function cleanupZombieState()
     serverState.active_watches = {}
     serverState.write_watch_sessions = {}
     serverState.patch_sets = serverState.patch_sets or {}
+    serverState.trainer_manifests = serverState.trainer_manifests or {}
 
     -- 4. Release any mapped memory MDL handles (Unit-21)
     if mappedMemoryMDL then
@@ -4605,6 +4606,7 @@ local function workflowEnsureState()
     serverState.value_hunts = serverState.value_hunts or {}
     serverState.write_watch_sessions = serverState.write_watch_sessions or {}
     serverState.patch_sets = serverState.patch_sets or {}
+    serverState.trainer_manifests = serverState.trainer_manifests or {}
 end
 
 local function workflowParseBytes(value)
@@ -5175,6 +5177,230 @@ function cmd_workflow_write_typed_batch(params)
     return { success = true, count = #results, results = results }
 end
 
+
+local function workflowLoadManifest(params)
+    workflowEnsureState()
+    if params.manifest and type(params.manifest) == "table" then return params.manifest, nil end
+    if params.name and serverState.trainer_manifests[params.name] then return serverState.trainer_manifests[params.name], nil end
+    if params.json and type(params.json) == "string" then
+        local ok, decoded = pcall(json.decode, params.json)
+        if ok and type(decoded) == "table" then return decoded, nil end
+        return nil, "Failed to parse manifest JSON: " .. tostring(decoded)
+    end
+    if params.file then
+        local f, err = io.open(params.file, "rb")
+        if not f then return nil, "Failed to open manifest file: " .. tostring(err) end
+        local text = f:read("*a")
+        f:close()
+        local ok, decoded = pcall(json.decode, text)
+        if ok and type(decoded) == "table" then return decoded, nil end
+        return nil, "Failed to parse manifest file JSON: " .. tostring(decoded)
+    end
+    return nil, "No manifest, name, json, or file provided"
+end
+
+local function workflowResolvePointerChain(chain)
+    local base = chain.base or chain.root or chain.address
+    local offsets = chain.offsets or {}
+    if type(base) == "string" then base = getAddressSafe(base) end
+    if not base then return { success = false, error = "Invalid base" } end
+    local current = base
+    local path = { toHex(base) }
+    for _, rawOffset in ipairs(offsets) do
+        local offset = rawOffset
+        if type(offset) == "string" then offset = tonumber(offset) or tonumber(offset:gsub("^0x", ""), 16) end
+        offset = offset or 0
+        local ptr = readPointer(current)
+        if not ptr then return { success = false, error = "Failed to read pointer at " .. toHex(current), path = path } end
+        current = ptr + offset
+        path[#path + 1] = toHex(current)
+    end
+    return { success = true, final_address = toHex(current), path = path }
+end
+
+function cmd_workflow_manifest_export(params)
+    workflowEnsureState()
+    local name = params.name or (params.game or params.process_name or "trainer")
+    local manifest = params.manifest or {
+        schema_version = 1,
+        name = name,
+        game = params.game,
+        process_name = params.process_name,
+        game_version = params.game_version,
+        trainer_version = params.trainer_version,
+        notes = params.notes,
+        created_at = os.time(),
+        pointer_chains = params.pointer_chains or {},
+        patches = params.patches or {},
+        signatures = params.signatures or {},
+        writer_reports = params.writer_reports or {}
+    }
+    manifest.name = manifest.name or name
+    manifest.schema_version = manifest.schema_version or 1
+    manifest.updated_at = os.time()
+
+    if params.include_patch_sets == true then
+        manifest.patch_sets = serverState.patch_sets or {}
+    end
+
+    serverState.trainer_manifests[manifest.name] = manifest
+    local encoded = json.encode(manifest)
+    local wrote = false
+    if params.output_file then
+        local f, err = io.open(params.output_file, "wb")
+        if not f then return { success = false, error = "Failed to write manifest: " .. tostring(err), error_code = "PERMISSION_DENIED" } end
+        f:write(encoded)
+        f:close()
+        wrote = true
+    end
+
+    return { success = true, name = manifest.name, manifest = manifest, json = encoded, output_file = params.output_file, wrote_file = wrote }
+end
+
+function cmd_workflow_manifest_import(params)
+    workflowEnsureState()
+    local manifest, err = workflowLoadManifest(params)
+    if not manifest then return { success = false, error = err, error_code = "INVALID_PARAMS" } end
+    manifest.name = manifest.name or params.name or "trainer"
+    manifest.schema_version = manifest.schema_version or 1
+    manifest.imported_at = os.time()
+    serverState.trainer_manifests[manifest.name] = manifest
+    return {
+        success = true,
+        name = manifest.name,
+        pointer_chain_count = #(manifest.pointer_chains or {}),
+        patch_count = #(manifest.patches or {}),
+        signature_count = #(manifest.signatures or {}),
+        writer_report_count = #(manifest.writer_reports or {})
+    }
+end
+
+function cmd_workflow_manifest_list(params)
+    workflowEnsureState()
+    local manifests = {}
+    for name, manifest in pairs(serverState.trainer_manifests) do
+        manifests[#manifests + 1] = {
+            name = name,
+            game = manifest.game,
+            process_name = manifest.process_name,
+            game_version = manifest.game_version,
+            pointer_chain_count = #(manifest.pointer_chains or {}),
+            patch_count = #(manifest.patches or {}),
+            signature_count = #(manifest.signatures or {})
+        }
+    end
+    table.sort(manifests, function(a, b) return tostring(a.name) < tostring(b.name) end)
+    return { success = true, count = #manifests, manifests = manifests }
+end
+
+function cmd_workflow_manifest_get(params)
+    workflowEnsureState()
+    local name = params.name
+    if not name then return { success = false, error = "Missing name", error_code = "INVALID_PARAMS" } end
+    local manifest = serverState.trainer_manifests[name]
+    if not manifest then return { success = false, error = "No manifest named '" .. name .. "'", error_code = "NOT_FOUND" } end
+    return { success = true, name = name, manifest = manifest, json = json.encode(manifest) }
+end
+
+function cmd_workflow_manifest_delete(params)
+    workflowEnsureState()
+    local name = params.name
+    if not name then return { success = false, error = "Missing name", error_code = "INVALID_PARAMS" } end
+    if not serverState.trainer_manifests[name] then return { success = false, error = "No manifest named '" .. name .. "'", error_code = "NOT_FOUND" } end
+    serverState.trainer_manifests[name] = nil
+    return { success = true, name = name, deleted = true }
+end
+
+function cmd_workflow_manifest_verify(params)
+    workflowEnsureState()
+    local manifest, err = workflowLoadManifest(params)
+    if not manifest then return { success = false, error = err, error_code = "INVALID_PARAMS" } end
+
+    local result = {
+        success = true,
+        name = manifest.name or params.name,
+        process = { expected = manifest.process_name, attached = nil, match = nil },
+        pointer_chains = {},
+        patches = {},
+        signatures = {},
+        summary = { ok = 0, failed = 0, unknown = 0 }
+    }
+
+    local info = cmd_get_process_info({})
+    if info and info.success then
+        result.process.attached = info.process_name
+        if manifest.process_name then
+            result.process.match = tostring(info.process_name):lower() == tostring(manifest.process_name):lower()
+        end
+    else
+        result.process.error = info and info.error or "No process attached"
+    end
+
+    for i, chain in ipairs(manifest.pointer_chains or {}) do
+        local resolved = workflowResolvePointerChain(chain)
+        resolved.name = chain.name or ("chain_" .. tostring(i))
+        resolved.base = chain.base or chain.root or chain.address
+        resolved.offsets = chain.offsets or {}
+        result.pointer_chains[#result.pointer_chains + 1] = resolved
+        if resolved.success then result.summary.ok = result.summary.ok + 1 else result.summary.failed = result.summary.failed + 1 end
+    end
+
+    for i, patch in ipairs(manifest.patches or {}) do
+        local addr = patch.address
+        if type(addr) == "string" then addr = getAddressSafe(addr) end
+        local entry = { name = patch.name or ("patch_" .. tostring(i)), address = patch.address, state = "unknown" }
+        if addr then
+            local original = nil
+            local patched = nil
+            if patch.original_bytes then original = workflowParseBytes(patch.original_bytes) end
+            if patch.patched_bytes then patched = workflowParseBytes(patch.patched_bytes) end
+            local size = original and #original or (patched and #patched or 0)
+            if size > 0 then
+                local current = workflowReadBytes(addr, size)
+                entry.current_bytes = current and workflowBytesToHex(current) or nil
+                entry.original_bytes = original and workflowBytesToHex(original) or nil
+                entry.patched_bytes = patched and workflowBytesToHex(patched) or nil
+                if patched and entry.current_bytes == entry.patched_bytes then entry.state = "patched"
+                elseif original and entry.current_bytes == entry.original_bytes then entry.state = "original"
+                else entry.state = "unknown" end
+            else
+                entry.error = "Missing original_bytes/patched_bytes"
+            end
+        else
+            entry.error = "Invalid address"
+        end
+        result.patches[#result.patches + 1] = entry
+        if entry.state == "original" or entry.state == "patched" then result.summary.ok = result.summary.ok + 1
+        elseif entry.error then result.summary.failed = result.summary.failed + 1
+        else result.summary.unknown = result.summary.unknown + 1 end
+    end
+
+    for i, sig in ipairs(manifest.signatures or {}) do
+        local pattern = sig.signature or sig.pattern or sig.aob
+        local entry = { name = sig.name or ("signature_" .. tostring(i)), pattern = pattern, count = 0, addresses = {} }
+        if pattern and pattern ~= "" then
+            local scan = AOBScan(pattern, sig.protection or "+X")
+            if scan then
+                entry.count = scan.Count or 0
+                for j = 0, math.min(entry.count - 1, params.signature_limit or 10) do
+                    local addrStr = scan.getString(j)
+                    if addrStr and not addrStr:match("^0x") and not addrStr:match("^0X") then addrStr = "0x" .. addrStr end
+                    entry.addresses[#entry.addresses + 1] = addrStr
+                end
+                pcall(function() scan.destroy() end)
+            end
+        else
+            entry.error = "Missing signature/pattern/aob"
+        end
+        result.signatures[#result.signatures + 1] = entry
+        if entry.count == 1 then result.summary.ok = result.summary.ok + 1
+        elseif entry.error then result.summary.failed = result.summary.failed + 1
+        else result.summary.unknown = result.summary.unknown + 1 end
+    end
+
+    result.success = result.summary.failed == 0
+    return result
+end
 -- >>> END UNIT-27 <<<
 -- >>> BEGIN UNIT-16 Function Analysis & Xref Tools <<<
 
@@ -7022,6 +7248,13 @@ commandHandlers = {
     workflow_patch_restore        = cmd_workflow_patch_restore,
     workflow_read_typed_batch     = cmd_workflow_read_typed_batch,
     workflow_write_typed_batch    = cmd_workflow_write_typed_batch,
+    workflow_manifest_export     = cmd_workflow_manifest_export,
+    workflow_manifest_import     = cmd_workflow_manifest_import,
+    workflow_manifest_list       = cmd_workflow_manifest_list,
+    workflow_manifest_get        = cmd_workflow_manifest_get,
+    workflow_manifest_delete     = cmd_workflow_manifest_delete,
+    workflow_manifest_verify     = cmd_workflow_manifest_verify,
+    
     -- >>> END UNIT-27 <<<
     -- >>> BEGIN UNIT-16 dispatcher entries <<<
     function_info           = cmd_function_info,
@@ -7274,6 +7507,8 @@ end
 
 -- Auto-start
 StartMCPBridge()
+
+
 
 
 

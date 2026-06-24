@@ -110,5 +110,7 @@ The bridge includes workflow-level tools intended for AI-driven trainer and memo
 - `workflow_pointer_chain_find` searches pointer roots by scanning for pointer values plus candidate offsets, ranking symbol/module roots first.
 - `workflow_patch_define/status/apply/restore` manages named patch sets with original-byte verification and restore support.
 - `workflow_read_typed_batch` and `workflow_write_typed_batch` handle compact typed bulk IO with optional verification.
+- `workflow_manifest_export/import/list/get/delete/verify` saves, loads, and verifies generic trainer manifests.
 
 Also keep `agent.md` updated; it is the operational guide for future AI sessions using this MCP.
+

@@ -220,6 +220,30 @@ Use this when a write/watch or AOB scan lands on code.
 
 ---
 
+
+---
+
+## Save and Verify a Trainer Manifest
+
+Use this once a trainer has useful chains, patches, signatures, or writer reports.
+
+1. Export the known data.
+   ```
+   workflow_manifest_export: name="GameName", process_name="game.exe", game_version="1.0", pointer_chains=[...], patches=[...], signatures=[...], output_file="R:\projects\GameName\trainer-manifest.json"
+   ```
+
+2. On a later run, import it.
+   ```
+   workflow_manifest_import: file="R:\projects\GameName\trainer-manifest.json"
+   ```
+
+3. Attach to the game and verify it.
+   ```
+   workflow_manifest_verify: name="GameName"
+   ```
+
+4. Start update work from any failed or `unknown` item.
+
 ## When to Use Low-Level Tools
 
 The older tools are still useful when the workflow wrapper is too broad:
@@ -229,4 +253,5 @@ The older tools are still useful when the workflow wrapper is too broad:
 - `memory_snapshot`, `memory_diff` for byte-level before/after comparisons.
 - `restore_bytes`, `write_memory`, `write_integer` for quick experiments.
 - `start_dbvm_watch`, `stop_dbvm_watch` when DBVM is available and stealth is important.
+
 

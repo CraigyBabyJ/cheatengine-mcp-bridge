@@ -27,6 +27,7 @@ Use workflow tools first when doing game trainer work:
 - `workflow_pointer_chain_find` for recovering a stable pointer chain from a dynamic address.
 - `workflow_patch_*` for code patches that need original-byte verification and restore.
 - `workflow_read_typed_batch` and `workflow_write_typed_batch` for reading/writing multiple values safely.
+- `workflow_manifest_*` to save, load, and verify reusable trainer data for any game.
 
 Use low-level tools when you already know the exact operation:
 
@@ -135,6 +136,36 @@ Use patch sets for code changes that must be reversible.
 
 Never apply a patch blindly if `workflow_patch_status` says `unknown`, unless the user explicitly accepts `force=true`.
 
+
+## Trainer Manifest Flow
+
+Use manifests once a value, writer, patch, or pointer chain is worth keeping.
+
+1. Export a manifest:
+
+```json
+{
+  "name": "ETS2",
+  "game": "Euro Truck Simulator 2",
+  "process_name": "eurotrucks2.exe",
+  "game_version": "1.60",
+  "pointer_chains": [
+    {"name": "money", "base": "eurotrucks2.exe+2D4F118", "offsets": [16, 16]}
+  ],
+  "patches": [
+    {"name": "damage_write", "address": "eurotrucks2.exe+10C81F9", "original_bytes": "44 89 44 88 04", "patched_bytes": "83 64 88 04 00"}
+  ],
+  "signatures": [],
+  "writer_reports": []
+}
+```
+
+2. Save to a file with `workflow_manifest_export`.
+3. Later, import it with `workflow_manifest_import`.
+4. Attach to the game and run `workflow_manifest_verify`.
+5. Any `unknown` or failed result is where the agent should start update recovery.
+
+Manifest tools are generic. Do not bake ETS2-specific behavior into the MCP; store game-specific data in manifest files.
 ## Updating Cheats After a Game Update
 
 1. Attach to the updated game.
@@ -166,4 +197,5 @@ These are examples of what a game-specific note should contain. They may become 
 - Damage chain example: `eurotrucks2.exe+33C0548 -> +2F98 -> +18 -> +1A8`
 - Money chain example: `eurotrucks2.exe+2D4F118 -> +10 -> +10`
 - Stable trainer logic should prefer module-relative roots and original-byte verified patches.
+
 
