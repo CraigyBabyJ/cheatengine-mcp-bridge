@@ -229,3 +229,4 @@ The older tools are still useful when the workflow wrapper is too broad:
 - `memory_snapshot`, `memory_diff` for byte-level before/after comparisons.
 - `restore_bytes`, `write_memory`, `write_integer` for quick experiments.
 - `start_dbvm_watch`, `stop_dbvm_watch` when DBVM is available and stealth is important.
+

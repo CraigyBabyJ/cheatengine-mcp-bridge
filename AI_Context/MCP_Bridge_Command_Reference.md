@@ -4,7 +4,7 @@
 >
 > **Architecture Support**: All commands automatically adapt to 32-bit or 64-bit targets. Pointer operations use `readPointer()` for automatic size handling.
 >
-> **Version**: This reference covers the full v12 tool surface (~206 tools) after all 26 implementation units land.
+> **Version**: This reference covers the full v12 tool surface (~207 tools) after all 26 implementation units land.
 
 ---
 
@@ -3637,6 +3637,7 @@ Workflow tools combine low-level CE operations into stateful flows for trainer c
 | `workflow_write_watch_start` | Watch up to four addresses with hardware data breakpoints |
 | `workflow_write_watch_poll` | Return captured hits and grouped writer summaries |
 | `workflow_write_watch_stop` | Stop a watch and remove its breakpoints |
+| `workflow_writer_report` | Convert a captured watch hit into trainer-making context with bytes, disassembly, NOP patch candidate, and optional signature |
 | `workflow_pointer_chain_find` | Search pointer roots where `pointer_value + offset == next_node` |
 | `workflow_patch_define` | Store a named patch set with patched bytes and optional original bytes |
 | `workflow_patch_status` | Read current bytes and report `original`, `patched`, or `unknown` |
@@ -3650,7 +3651,7 @@ Recommended flow:
 ```
 workflow_value_hunt_start -> in-game change -> workflow_value_hunt_refine
 workflow_value_hunt_results -> workflow_write_watch_start -> in-game trigger
-workflow_write_watch_poll -> workflow_pointer_chain_find -> workflow_patch_define/status/apply
+workflow_write_watch_poll -> workflow_writer_report -> workflow_pointer_chain_find -> workflow_patch_define/status/apply
 ```
 
 Use `agent.md` for the operational AI playbook and examples.
@@ -3723,4 +3724,5 @@ Use `agent.md` for the operational AI playbook and examples.
 10. **Use `dissect_structure`** on unknown pointers to immediately understand their layout.
 11. **Use `get_rtti_classname`** to identify C++ object types instantly.
 12. **Enable BSOD prevention**: In CE Settings → Extra, disable "Query memory region routines".
+
 

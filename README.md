@@ -194,7 +194,7 @@ Use the `ping` tool to verify connectivity:
 
 ---
 
-## ~206 MCP Tools Available
+## ~207 MCP Tools Available
 
 ### Memory
 | Tool | Description |
@@ -229,6 +229,7 @@ Use the `ping` tool to verify connectivity:
 |------|-------------|
 | `workflow_value_hunt_*` | Named multi-step scan sessions for exact/changed/increased/decreased value hunting |
 | `workflow_write_watch_*` | Watch up to four addresses and summarize which instructions write/access them |
+| `workflow_writer_report` | Convert a captured writer hit into trainer context: bytes, disassembly, patch candidate, and optional signature |
 | `workflow_pointer_chain_find` | Recover likely pointer chains to a dynamic address and rank stable roots |
 | `workflow_patch_*` | Define, verify, apply, and restore named patch sets |
 | `workflow_read_typed_batch`, `workflow_write_typed_batch` | Compact typed bulk IO with optional verification |
@@ -398,4 +399,5 @@ You no longer need to be an expert. Just ask the right questions.
 ⚠️ EDUCATIONAL DISCLAIMER
 
 This code is for educational and research purposes only. It's created to show the capabilities of the Model Context Protocol (MCP) and LLM-based debugging. I do not condone the use of these tools for malicious hacking, cheating in multiplayer games, or violating Terms of Service. This is a demonstration of software engineering automation.
+
 

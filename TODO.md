@@ -5,6 +5,7 @@
 - Added agent workflow MCP tools:
   - `workflow_value_hunt_start/refine/results/destroy`
   - `workflow_write_watch_start/poll/stop`
+  - `workflow_writer_report`
   - `workflow_pointer_chain_find`
   - `workflow_patch_define/status/apply/restore`
   - `workflow_read_typed_batch`
@@ -31,3 +32,5 @@
   - `workflow_value_hunt_destroy`
   - `workflow_read_typed_batch`
 - Run live write-watch testing only when a target process can safely be paused/continued.
+- Run a writer report live test after a watch captures at least one hit.
+

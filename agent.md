@@ -23,6 +23,7 @@ Use workflow tools first when doing game trainer work:
 
 - `workflow_value_hunt_*` for guided value scans.
 - `workflow_write_watch_*` for finding what writes/accesses candidate addresses.
+- `workflow_writer_report` after polling a watch, to turn a hit into trainer context.
 - `workflow_pointer_chain_find` for recovering a stable pointer chain from a dynamic address.
 - `workflow_patch_*` for code patches that need original-byte verification and restore.
 - `workflow_read_typed_batch` and `workflow_write_typed_batch` for reading/writing multiple values safely.
@@ -165,3 +166,4 @@ These are examples of what a game-specific note should contain. They may become 
 - Damage chain example: `eurotrucks2.exe+33C0548 -> +2F98 -> +18 -> +1A8`
 - Money chain example: `eurotrucks2.exe+2D4F118 -> +10 -> +10`
 - Stable trainer logic should prefer module-relative roots and original-byte verified patches.
+

@@ -4915,6 +4915,78 @@ function cmd_workflow_write_watch_poll(params)
     return { success = true, name = name, total = total, offset = offset, limit = limit, returned = #page, hits = page, summary = summary, active = session.active ~= false, active_breakpoints = #(session.breakpoint_ids or {}) }
 end
 
+
+function cmd_workflow_writer_report(params)
+    workflowEnsureState()
+    local name = params.name
+    if not name then return { success = false, error = "Missing name", error_code = "INVALID_PARAMS" } end
+    local session = serverState.write_watch_sessions[name]
+    if not session then return { success = false, error = "No write-watch session named '" .. name .. "'", error_code = "NOT_FOUND" } end
+
+    local hitIndex = math.max(1, params.hit_index or 1)
+    local hit = (session.hits or {})[hitIndex]
+    if not hit then
+        return { success = false, error = "No hit at index " .. tostring(hitIndex), error_code = "NOT_FOUND", hit_count = #(session.hits or {}) }
+    end
+
+    local ip = hit.instruction_pointer
+    if type(ip) == "string" then ip = getAddressSafe(ip) end
+    if not ip then return { success = false, error = "Hit has no valid instruction pointer", error_code = "INVALID_ADDRESS" } end
+
+    local instructionCount = math.max(1, math.min(params.instruction_count or 12, 64))
+    local instSize = getInstructionSize(ip) or 1
+    if instSize <= 0 then instSize = 1 end
+
+    local originalBytes = workflowReadBytes(ip, instSize)
+    local originalHex = originalBytes and workflowBytesToHex(originalBytes) or nil
+    local nop = {}
+    for i = 1, instSize do nop[#nop + 1] = 0x90 end
+    local nopHex = workflowBytesToHex(nop)
+
+    local disassembly = cmd_disassemble({
+        address = toHex(ip),
+        count = instructionCount,
+        offset = 0,
+        limit = instructionCount
+    })
+
+    local signature = nil
+    if params.include_signature == true then
+        local ok, sig = pcall(function() return cmd_generate_signature({ address = toHex(ip) }) end)
+        if ok then signature = sig else signature = { success = false, error = tostring(sig) } end
+    end
+
+    local patchSetExample = {
+        name = name .. "_writer_patch",
+        patches = {
+            {
+                name = "writer_" .. tostring(hitIndex),
+                address = toHex(ip),
+                original_bytes = originalHex,
+                patched_bytes = nopHex
+            }
+        }
+    }
+
+    return {
+        success = true,
+        session = name,
+        hit_index = hitIndex,
+        watched_address = hit.watched_address,
+        writer_address = toHex(ip),
+        writer_symbol = workflowGetSymbol(ip),
+        instruction = hit.instruction,
+        instruction_size = instSize,
+        original_bytes = originalHex,
+        nop_patch_bytes = nopHex,
+        value_bytes_at_hit = hit.value_bytes,
+        registers = hit.registers,
+        disassembly = disassembly.success and disassembly.instructions or {},
+        signature = signature,
+        patch_set_example = patchSetExample,
+        recommendation = "Verify the writer affects only the intended value before applying the NOP patch candidate. If it is shared code, prefer a code cave or conditional patch using the captured registers/object pointer."
+    }
+end
 function cmd_workflow_write_watch_stop(params)
     local name = params.name
     if not name then return { success = false, error = "Missing name", error_code = "INVALID_PARAMS" } end
@@ -6942,6 +7014,7 @@ commandHandlers = {
     workflow_write_watch_start    = cmd_workflow_write_watch_start,
     workflow_write_watch_poll     = cmd_workflow_write_watch_poll,
     workflow_write_watch_stop     = cmd_workflow_write_watch_stop,
+    workflow_writer_report        = cmd_workflow_writer_report,
     workflow_pointer_chain_find   = cmd_workflow_pointer_chain_find,
     workflow_patch_define         = cmd_workflow_patch_define,
     workflow_patch_status         = cmd_workflow_patch_status,
@@ -7201,6 +7274,7 @@ end
 
 -- Auto-start
 StartMCPBridge()
+
 
 
 
