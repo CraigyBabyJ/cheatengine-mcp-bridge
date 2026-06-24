@@ -1561,6 +1561,232 @@ def main():
         #   Unit 21 (read_clipboard / write_clipboard) — side-effects on clipboard
         #   Unit 22 (show_message_box) — blocks CE GUI thread waiting for user input
 
+
+        print("\n" + "=" * 70)
+        print("UNIT-27: Agent Workflow Tools")
+        print("=" * 70)
+
+        _u27_skip = None if _proc_ok else "No process attached"
+        _u27_scratch_skip = None if _scratch_addr else "No scratch memory allocated"
+        _manifest_name = "unit27_test_manifest"
+        _manifest = {
+            "name": _manifest_name,
+            "game": "MCP Test Target",
+            "process_name": module_name,
+            "game_version": "test",
+            "pointer_chains": [
+                {"name": "module_base", "base": hex(module_base), "offsets": []}
+            ],
+            "patches": [],
+            "signatures": [],
+            "writer_reports": []
+        }
+        if _scratch_addr:
+            _manifest["patches"].append({
+                "name": "scratch_dword",
+                "address": _scratch_hex0,
+                "original_bytes": "EF BE AD DE",
+                "patched_bytes": "90 90 90 90",
+            })
+
+        all_tests["u27_manifest_export"] = TestCase(
+            "Unit-27 manifest export", "workflow_manifest_export",
+            params={
+                "name": _manifest_name,
+                "game": _manifest["game"],
+                "process_name": module_name,
+                "game_version": "test",
+                "pointer_chains": _manifest["pointer_chains"],
+                "patches": _manifest["patches"],
+                "signatures": [],
+                "writer_reports": [],
+            },
+            validators=[
+                has_field("success", bool),
+                field_equals("success", True),
+                has_field("manifest", dict),
+                has_field("json", str),
+            ],
+            skip_reason=_u27_skip,
+        )
+        all_tests["u27_manifest_export"].run(client)
+
+        _manifest_json = None
+        if all_tests["u27_manifest_export"].result == TestResult.PASSED:
+            _manifest_json = all_tests["u27_manifest_export"].response.get("json")
+
+        all_tests["u27_manifest_import"] = TestCase(
+            "Unit-27 manifest import", "workflow_manifest_import",
+            params={"name": _manifest_name, "json": _manifest_json or json.dumps(_manifest)},
+            validators=[
+                has_field("success", bool),
+                field_equals("success", True),
+                has_field("name", str),
+                field_equals("name", _manifest_name),
+            ],
+            skip_reason=_cascaded_skip("u27_manifest_export", _u27_skip, "manifest export failed"),
+        )
+        all_tests["u27_manifest_import"].run(client)
+
+        all_tests["u27_manifest_list"] = TestCase(
+            "Unit-27 manifest list", "workflow_manifest_list",
+            validators=[
+                has_field("success", bool),
+                field_equals("success", True),
+                has_field("manifests", list),
+                lambda r: (
+                    any(m.get("name") == _manifest_name for m in r.get("manifests", [])),
+                    f"Expected manifest {_manifest_name} in list",
+                ),
+            ],
+            skip_reason=_cascaded_skip("u27_manifest_import", _u27_skip, "manifest import failed"),
+        )
+        all_tests["u27_manifest_list"].run(client)
+
+        all_tests["u27_manifest_get"] = TestCase(
+            "Unit-27 manifest get", "workflow_manifest_get",
+            params={"name": _manifest_name},
+            validators=[
+                has_field("success", bool),
+                field_equals("success", True),
+                has_field("manifest", dict),
+                has_field("json", str),
+            ],
+            skip_reason=_cascaded_skip("u27_manifest_import", _u27_skip, "manifest import failed"),
+        )
+        all_tests["u27_manifest_get"].run(client)
+
+        all_tests["u27_manifest_verify"] = TestCase(
+            "Unit-27 manifest verify", "workflow_manifest_verify",
+            params={"name": _manifest_name},
+            validators=[
+                has_field("success", bool),
+                has_field("summary", dict),
+                has_field("pointer_chains", list),
+                lambda r: (
+                    len(r.get("pointer_chains", [])) >= 1 and r["pointer_chains"][0].get("success") is True,
+                    "Expected module_base pointer chain to resolve",
+                ),
+            ],
+            skip_reason=_cascaded_skip("u27_manifest_import", _u27_skip, "manifest import failed"),
+        )
+        all_tests["u27_manifest_verify"].run(client)
+
+        all_tests["u27_read_typed_batch"] = TestCase(
+            "Unit-27 typed batch read", "workflow_read_typed_batch",
+            params={"reads": [{"address": _scratch_hex0, "type": "dword"}, {"address": _scratch_hex4, "type": "byte"}]},
+            validators=[
+                has_field("success", bool),
+                field_equals("success", True),
+                has_field("results", list),
+                field_equals("count", 2),
+            ],
+            skip_reason=_u27_scratch_skip,
+        )
+        all_tests["u27_read_typed_batch"].run(client)
+
+        all_tests["u27_write_typed_batch"] = TestCase(
+            "Unit-27 typed batch write", "workflow_write_typed_batch",
+            params={
+                "writes": [
+                    {"address": _scratch_hex0, "type": "dword", "value": 0x12345678},
+                    {"address": _scratch_hex4, "type": "byte", "value": 0x42},
+                ],
+                "verify": True,
+            },
+            validators=[
+                has_field("success", bool),
+                field_equals("success", True),
+                has_field("results", list),
+                field_equals("count", 2),
+                lambda r: (
+                    all(item.get("success") is True for item in r.get("results", [])),
+                    "Expected every typed write to succeed",
+                ),
+            ],
+            skip_reason=_u27_scratch_skip,
+        )
+        all_tests["u27_write_typed_batch"].run(client)
+
+        all_tests["u27_write_typed_batch_readback"] = TestCase(
+            "Unit-27 typed batch write readback", "workflow_read_typed_batch",
+            params={"reads": [{"address": _scratch_hex0, "type": "dword"}, {"address": _scratch_hex4, "type": "byte"}]},
+            validators=[
+                has_field("success", bool),
+                field_equals("success", True),
+                lambda r: (
+                    len(r.get("results", [])) == 2
+                    and r["results"][0].get("value") == 0x12345678
+                    and r["results"][1].get("value") == 0x42,
+                    "Expected typed batch readback values 0x12345678 and 0x42",
+                ),
+            ],
+            skip_reason=_cascaded_skip("u27_write_typed_batch", _u27_scratch_skip, "typed batch write failed"),
+        )
+        all_tests["u27_write_typed_batch_readback"].run(client)
+
+        all_tests["u27_value_hunt_start"] = TestCase(
+            "Unit-27 value hunt start", "workflow_value_hunt_start",
+            params={"name": "unit27_value", "value": str(0x12345678), "value_type": "dword"},
+            validators=[
+                has_field("success", bool),
+                field_equals("success", True),
+                has_field("count", int),
+            ],
+            skip_reason=_u27_scratch_skip,
+        )
+        all_tests["u27_value_hunt_start"].run(client)
+
+        all_tests["u27_value_hunt_results"] = TestCase(
+            "Unit-27 value hunt results", "workflow_value_hunt_results",
+            params={"name": "unit27_value", "limit": 5},
+            validators=[
+                has_field("success", bool),
+                field_equals("success", True),
+                has_field("results", list),
+                has_field("total", int),
+            ],
+            skip_reason=_cascaded_skip("u27_value_hunt_start", _u27_scratch_skip, "value hunt start failed"),
+        )
+        all_tests["u27_value_hunt_results"].run(client)
+
+        all_tests["u27_value_hunt_destroy"] = TestCase(
+            "Unit-27 value hunt destroy", "workflow_value_hunt_destroy",
+            params={"name": "unit27_value"},
+            validators=[
+                has_field("success", bool),
+                field_equals("success", True),
+                field_equals("destroyed", True),
+            ],
+            skip_reason=_cascaded_skip("u27_value_hunt_start", _u27_scratch_skip, "value hunt start failed"),
+        )
+        all_tests["u27_value_hunt_destroy"].run(client)
+
+        all_tests["u27_write_watch_start"] = TestCase(
+            "Unit-27 write watch start", "workflow_write_watch_start",
+            params={"name": "unit27_watch", "addresses": [_scratch_hex0], "size": 4, "max_hits": 1},
+            skip_reason="Skipped by design: live hardware watchpoints can pause/freeze arbitrary targets",
+        )
+        all_tests["u27_write_watch_start"].run(client)
+
+        all_tests["u27_writer_report"] = TestCase(
+            "Unit-27 writer report", "workflow_writer_report",
+            params={"name": "unit27_watch", "hit_index": 1},
+            skip_reason="Skipped by design: requires a captured live write-watch hit",
+        )
+        all_tests["u27_writer_report"].run(client)
+
+        all_tests["u27_manifest_delete"] = TestCase(
+            "Unit-27 manifest delete", "workflow_manifest_delete",
+            params={"name": _manifest_name},
+            validators=[
+                has_field("success", bool),
+                field_equals("success", True),
+                field_equals("deleted", True),
+            ],
+            skip_reason=_cascaded_skip("u27_manifest_import", _u27_skip, "manifest import failed"),
+        )
+        all_tests["u27_manifest_delete"].run(client)
     # >>> END UNIT-24 <<<
 
     if allocated_regions:
@@ -1599,6 +1825,17 @@ def main():
         "u24_smoke_get_temp_folder", "u24_smoke_beep",
     ]
 
+    _u27_manifest_keys = [
+        "u27_manifest_export", "u27_manifest_import", "u27_manifest_list",
+        "u27_manifest_get", "u27_manifest_verify", "u27_manifest_delete",
+    ]
+    _u27_io_keys = [
+        "u27_read_typed_batch", "u27_write_typed_batch", "u27_write_typed_batch_readback",
+    ]
+    _u27_scan_keys = [
+        "u27_value_hunt_start", "u27_value_hunt_results", "u27_value_hunt_destroy",
+    ]
+    _u27_watch_keys = ["u27_write_watch_start", "u27_writer_report"]
     # =========================================================================
     # SUMMARY
     # =========================================================================
@@ -1629,6 +1866,10 @@ def main():
         "U24 Pagination": _u24_page_keys,
         "U24 Error Cases": _u24_err_keys,
         "U24 Smoke Tests": _u24_smoke_keys,
+        "U27 Manifests": _u27_manifest_keys,
+        "U27 Typed IO": _u27_io_keys,
+        "U27 Value Hunt": _u27_scan_keys,
+        "U27 Watch/Report": _u27_watch_keys,
     }
     
     for cat_name, tests in categories.items():
@@ -1671,3 +1912,4 @@ def main():
 if __name__ == "__main__":
     success = main()
     sys.exit(0 if success else 1)
+

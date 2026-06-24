@@ -13,15 +13,13 @@
   - `workflow_manifest_export/import/list/get/delete/verify`
 - Updated `README.md`, `AGENTS.md`, `agent.md`, and `AI_Context/MCP_Bridge_Command_Reference.md` for the new workflow tools.
 - Updated `AI_Context/Recommended_Workflows.md` to prefer workflow tools over low-level scan/breakpoint commands.
+- Added Unit-27 integration smoke tests for manifests, typed batch IO, value hunts, and safe skipped watch/report placeholders.
 
 ## Next Useful Additions
 
-1. Add integration tests in `MCP_Server/test_mcp.py` for Unit-27 workflow tools, including manifest import/export/verify.
-2. Add a small `workflow_signature_rebase` helper that validates old patch signatures after game updates and suggests new module offsets.
-3. Add `workflow_export_trainer_manifest` to write discovered chains/patches/signatures into a JSON manifest for game-specific trainers.
-4. Add `workflow_import_trainer_manifest` so an agent can load a manifest and verify all chains/patches in one call.
-5. Add a safer patch dry-run mode that reports original-byte mismatches across an entire patch set instead of stopping at the first mismatch.
-6. Add optional module/range limits to `workflow_pointer_chain_find` so deep searches can be faster on large games.
+1. Add a small `workflow_signature_rebase` helper that validates old patch signatures after game updates and suggests new module offsets.
+2. Add a safer patch dry-run mode that reports original-byte mismatches across an entire patch set instead of stopping at the first mismatch.
+3. Add optional module/range limits to `workflow_pointer_chain_find` so deep searches can be faster on large games.
 
 ## Validation Still Needed
 
@@ -34,5 +32,6 @@
   - `workflow_read_typed_batch`
 - Run live write-watch testing only when a target process can safely be paused/continued.
 - Run a writer report live test after a watch captures at least one hit.
+
 
 
